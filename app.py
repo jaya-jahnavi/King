@@ -2,6 +2,8 @@
 import csv
 import ctypes
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
@@ -12,6 +14,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from counting import Counter, RoundGate, RANKS
+from automatic import AutoReader, AutoTracker
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'calibration'
@@ -49,6 +52,13 @@ class App:
         self.counter = Counter()
         self.gate = RoundGate()
         self.running = False
+        self.auto = tk.BooleanVar(value=True)
+        self.tracker = AutoTracker()
+        self.worker = ThreadPoolExecutor(max_workers=1)
+        self.reader = None
+        self.future = None
+        self.generation = 0
+        self.detections = []
         self.status = tk.StringVar(value='Screen preview is live. Select the screen containing your browser, then click Select table.')
         self.stats = tk.StringVar()
         self.threshold = tk.DoubleVar(value=0.90)
@@ -62,7 +72,8 @@ class App:
         self.monitor_choice = ttk.Combobox(source, values=self.monitor_names, state='readonly', width=24)
         self.monitor_choice.current(0)
         self.monitor_choice.pack(side='left', padx=8)
-        ttk.Label(source, text='Preview works before calibration. Select table to crop this screen.').pack(side='left')
+        ttk.Checkbutton(source, text='Automatic card reading', variable=self.auto, command=self.change_mode).pack(side='left')
+        ttk.Label(source, text='Select table to start automatic counting.').pack(side='left', padx=8)
         bar = ttk.Frame(window, padding=10)
         bar.pack(fill='x')
         for label, command in [('Select table', self.select_table), ('Add card position', self.add_slot),
@@ -80,13 +91,16 @@ class App:
             ttk.Button(controls, text=rank, width=3, command=lambda r=rank: self.manual(r)).pack(side='left', padx=1)
         ttk.Button(controls, text='Undo last', command=self.undo).pack(side='left', padx=6)
         ttk.Button(controls, text='Export CSV', command=self.export).pack(side='left')
-        ttk.Label(controls, text=' Match threshold:').pack(side='left')
+        ttk.Label(controls, text=' Manual match:').pack(side='left')
         ttk.Spinbox(controls, from_=0.7, to=0.99, increment=0.01, width=5, textvariable=self.threshold).pack(side='left')
         self.log = tk.Listbox(window, height=8, font=('Consolas', 10))
         self.log.pack(fill='both', expand=True, padx=12, pady=8)
-        ttk.Label(window, text='Fixed layout prototype • Pause before calibration • Next round only after old cards clear',
+        ttk.Label(window, text='Automatic: visible white cards • Three matching reads • Clear table for 3 seconds between hands • Reset at shuffle',
                   padding=8).pack()
         self.load()
+        if self.region:
+            self.running = True
+            self.status.set('Starting automatic reader for saved table region. Keep King outside the captured area.')
         self.refresh()
         window.protocol('WM_DELETE_WINDOW', self.close)
         window.after(200, self.tick)
@@ -101,13 +115,46 @@ class App:
                     self.window.winfo_screenwidth() * 0.85 / width,
                     self.window.winfo_screenheight() * 0.75 / height)
         shown = cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))))
-        try:
-            box = cv2.selectROI(title, shown, showCrosshair=True, fromCenter=False)
-        finally:
-            cv2.destroyAllWindows()
-        if not box[2] or not box[3]:
+        dialog = tk.Toplevel(self.window)
+        dialog.title(title)
+        dialog.attributes('-topmost', True)
+        ttk.Label(dialog, text='Drag to select • Enter accepts • Escape cancels', padding=8).pack()
+        canvas = tk.Canvas(dialog, width=shown.shape[1], height=shown.shape[0], highlightthickness=0)
+        canvas.pack()
+        picture = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(shown, cv2.COLOR_BGR2RGB)))
+        canvas.create_image(0, 0, anchor='nw', image=picture)
+        state = {'start': None, 'box': None, 'rectangle': None, 'accepted': False}
+
+        def press(event):
+            state['start'] = (max(0, min(shown.shape[1], event.x)), max(0, min(shown.shape[0], event.y)))
+
+        def drag(event):
+            if state['start'] is None:
+                return
+            x0, y0 = state['start']
+            x1, y1 = max(0, min(shown.shape[1], event.x)), max(0, min(shown.shape[0], event.y))
+            state['box'] = (min(x0, x1), min(y0, y1), abs(x1-x0), abs(y1-y0))
+            if state['rectangle'] is not None:
+                canvas.delete(state['rectangle'])
+            state['rectangle'] = canvas.create_rectangle(x0, y0, x1, y1, outline='#00ff88', width=2)
+
+        def accept(event=None):
+            if state['box'] and min(state['box'][2:]) > 2:
+                state['accepted'] = True
+                dialog.destroy()
+
+        canvas.bind('<ButtonPress-1>', press)
+        canvas.bind('<B1-Motion>', drag)
+        canvas.bind('<ButtonRelease-1>', drag)
+        dialog.bind('<Return>', accept)
+        dialog.bind('<Escape>', lambda event: dialog.destroy())
+        ttk.Button(dialog, text='Use selected area', command=accept).pack(pady=8)
+        dialog.grab_set()
+        dialog.focus_force()
+        self.window.wait_window(dialog)
+        if not state['accepted']:
             return None
-        x, y, w, h = box
+        x, y, w, h = state['box']
         left, top = round(x / scale), round(y / scale)
         right, bottom = min(width, round((x+w) / scale)), min(height, round((y+h) / scale))
         return left, top, right-left, bottom-top
@@ -115,11 +162,25 @@ class App:
     def selected_monitor(self):
         return self.capture.monitors[self.monitor_choice.current() + 1]
 
+    def invalidate(self):
+        self.generation += 1
+
+    def change_mode(self):
+        self.running = False
+        self.invalidate()
+        self.status.set('Mode changed. Press Start to continue. Automatic mode needs no templates or card positions.')
+
+    def read_auto(self, frame):
+        if self.reader is None:
+            self.reader = AutoReader()
+        return self.reader.detect(frame)
+
     def select_table(self):
         if self.counter.events:
             messagebox.showinfo('New shoe needed', 'Use Shuffle / New shoe before changing the table region.')
             return
         self.running = False
+        self.invalidate()
         # Let Windows reveal the browser before taking the selection screenshot.
         self.window.withdraw()
         self.window.after(400, self.finish_table_selection)
@@ -134,8 +195,11 @@ class App:
                 self.region = dict(left=monitor['left'] + x, top=monitor['top'] + y, width=w, height=h)
                 self.slots = []
                 self.gate.reset()
+                self.tracker.reset()
+                self.detections = []
                 self.save()
-                self.status.set('Table preview is live. Move King away from the captured area. Add card positions to configure counting.')
+                self.running = self.auto.get()
+                self.status.set('Automatic reader starting. Keep King outside the table crop.' if self.running else 'Table selected. Configure manual positions or enable automatic reading.')
         except Exception as exc:
             self.status.set(f'Could not select screen: {exc}')
         finally:
@@ -177,18 +241,24 @@ class App:
 
     def toggle(self):
         if not self.running:
-            if not self.region or not self.slots:
-                return self.status.set('Select a table and at least one card position first.')
-            missing = set(RANKS) - self.templates.keys()
-            if missing:
-                return self.status.set('Missing templates: ' + ', '.join(r for r in RANKS if r in missing))
+            if not self.region:
+                return self.status.set('Click Select table and select the browser video first.')
+            if not self.auto.get():
+                if not self.slots:
+                    return self.status.set('Add card positions for manual mode, or enable Automatic card reading.')
+                missing = set(RANKS) - self.templates.keys()
+                if missing:
+                    return self.status.set('Missing templates: ' + ', '.join(r for r in RANKS if r in missing))
         self.running = not self.running
+        self.invalidate()
         self.status.set('Capturing. Keep the stream visible and this app outside the captured region.' if self.running else 'Paused.')
 
     def next_round(self):
         self.running = False
         self.gate.reset()
-        self.status.set('Round positions reset; count retained. Wait for old cards to clear, then press Start.')
+        self.tracker.reset()
+        self.invalidate()
+        self.status.set('Card tracking reset; shoe count retained. Wait for old cards to clear, then press Start.')
 
     def shuffle(self):
         decks = simpledialog.askinteger('New shoe', 'Starting decks (1–12):', initialvalue=self.counter.decks,
@@ -197,6 +267,8 @@ class App:
             self.running = False
             self.counter = Counter(decks)
             self.gate.reset()
+            self.tracker.reset()
+            self.invalidate()
             self.refresh()
             self.status.set('New shoe ready. Start counting from the beginning of the shoe.')
 
@@ -209,10 +281,11 @@ class App:
 
     def undo(self):
         self.running = False
+        self.invalidate()
         if self.counter.events:
             self.counter.events.pop()
         self.refresh()
-        self.status.set('Paused. Last card removed; position stays locked. Add its correct rank manually if needed.')
+        self.status.set('Paused. Last card removed; its track stays counted. Add its correct rank manually if needed.')
 
     def refresh(self):
         true = 'N/A' if self.counter.true is None else f'{self.counter.true:+.2f}'
@@ -227,6 +300,33 @@ class App:
         try:
             if self.window.state() != 'withdrawn':
                 frame = self.grab() if self.region else np.array(self.capture.grab(self.selected_monitor()))[:, :, :3].copy()
+                if self.future is not None and self.future.done():
+                    pending, generation, captured_at = self.future, self.pending_generation, self.pending_time
+                    self.future = None
+                    try:
+                        detected = pending.result()
+                    except Exception as exc:
+                        if self.running and generation == self.generation:
+                            self.running = False
+                            self.status.set(f'Automatic reader unavailable: {exc}. Run pip install -r requirements.txt, then restart.')
+                    else:
+                        if self.running and self.auto.get() and generation == self.generation:
+                            self.detections = detected
+                            for detection in self.tracker.update(detected, captured_at):
+                                self.counter.add(detection.rank, f'auto OCR ({detection.score:.2f})')
+                                self.refresh()
+                            readable = sum(bool(d.rank) for d in detected)
+                            self.status.set(f'Automatic counting active: {len(detected)} card shapes, {readable} readable ranks. Clear table 3 seconds between hands; reset at shuffle.')
+                if self.running and self.auto.get() and self.region and self.future is None:
+                    self.pending_generation, self.pending_time = self.generation, time.monotonic()
+                    self.future = self.worker.submit(self.read_auto, frame.copy())
+                if self.auto.get() and self.region:
+                    for detection in self.detections:
+                        x, y, w, h = detection.box
+                        color = (50, 200, 50) if detection.rank else (0, 180, 255)
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                        cv2.putText(frame, f'{detection.rank or "?"} {detection.score:.2f}', (x, max(16, y-5)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2)
                 try:
                     threshold = float(self.threshold.get())
                     if not 0.7 <= threshold <= 0.99:
@@ -235,7 +335,7 @@ class App:
                     self.running = False
                     threshold = 0.90
                     self.status.set('Enter a match threshold from 0.70 to 0.99.')
-                for i, (x, y, w, h) in enumerate(self.slots if self.region else []):
+                for i, (x, y, w, h) in enumerate(self.slots if self.region and not self.auto.get() else []):
                     rank, score = recognize(frame[y:y+h, x:x+w], self.templates, threshold)
                     if self.running:
                         emitted = self.gate.observe(i, rank)
@@ -289,6 +389,8 @@ class App:
                 writer.writerows((i, e.rank, e.source) for i, e in enumerate(self.counter.events, 1))
 
     def close(self):
+        self.running = False
+        self.worker.shutdown(wait=False, cancel_futures=True)
         self.capture.close()
         self.window.destroy()
 
