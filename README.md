@@ -15,7 +15,7 @@ python -m venv .venv
 ## Calibrate your stream
 
 1. Open the stream at a fixed browser zoom and video size. Keep it visible, with the King window outside the table region. Screen capture cannot see a hidden or minimized tab.
-2. Click **Select table**. Drag around the video table on the captured desktop image, then press Enter. Escape cancels.
+2. A live screen preview appears immediately, before calibration. Choose the browser's screen in the **Screen** dropdown, then click **Select table**. King temporarily hides itself so the browser is visible in the selection screenshot. Drag around the video table on the fitted desktop image, then press Enter. Escape cancels. After selection, the preview uses that saved crop; choose Select table again to change it. Keep King outside that crop.
 3. Click **Add card position** for each possible dealt-card location, including dealer cards. Select a tight box containing only the upright rank, excluding its suit. Each position represents one physical card in that round. Configure enough positions for extra cards, splits and hits if the layout allows it.
 4. Click **Save rank template**. Select a visible rank with the same padding as the position boxes and label it. Repeat for all 13 ranks, including 10. Calibration is saved locally. Use sample footage or paused frames to obtain all ranks.
 5. Click **Shuffle / New shoe** and enter the starting number of decks. Start at the beginning of a shoe for a meaningful count.
