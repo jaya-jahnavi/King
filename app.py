@@ -49,11 +49,20 @@ class App:
         self.counter = Counter()
         self.gate = RoundGate()
         self.running = False
-        self.status = tk.StringVar(value='Select table, add card positions, then calibrate rank templates.')
+        self.status = tk.StringVar(value='Screen preview is live. Select the screen containing your browser, then click Select table.')
         self.stats = tk.StringVar()
         self.threshold = tk.DoubleVar(value=0.90)
         window.title('King • Live card count prototype')
         window.geometry('1060x820')
+        source = ttk.Frame(window, padding=8)
+        source.pack(fill='x')
+        ttk.Label(source, text='Screen:').pack(side='left')
+        self.monitor_names = [f'{i}: {m["width"]} × {m["height"]}'
+                              for i, m in enumerate(self.capture.monitors[1:], 1)]
+        self.monitor_choice = ttk.Combobox(source, values=self.monitor_names, state='readonly', width=24)
+        self.monitor_choice.current(0)
+        self.monitor_choice.pack(side='left', padx=8)
+        ttk.Label(source, text='Preview works before calibration. Select table to crop this screen.').pack(side='left')
         bar = ttk.Frame(window, padding=10)
         bar.pack(fill='x')
         for label, command in [('Select table', self.select_table), ('Add card position', self.add_slot),
@@ -86,25 +95,51 @@ class App:
         return np.array(self.capture.grab(self.region))[:, :, :3].copy()
 
     def select(self, frame, title):
-        box = cv2.selectROI(title, frame, showCrosshair=True, fromCenter=False)
-        cv2.destroyAllWindows()
-        return tuple(map(int, box)) if box[2] and box[3] else None
+        # Fit the selection image onto the display, including on 4K/multi-screen setups.
+        height, width = frame.shape[:2]
+        scale = min(1.0, 1200 / width, 650 / height,
+                    self.window.winfo_screenwidth() * 0.85 / width,
+                    self.window.winfo_screenheight() * 0.75 / height)
+        shown = cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))))
+        try:
+            box = cv2.selectROI(title, shown, showCrosshair=True, fromCenter=False)
+        finally:
+            cv2.destroyAllWindows()
+        if not box[2] or not box[3]:
+            return None
+        x, y, w, h = box
+        left, top = round(x / scale), round(y / scale)
+        right, bottom = min(width, round((x+w) / scale)), min(height, round((y+h) / scale))
+        return left, top, right-left, bottom-top
+
+    def selected_monitor(self):
+        return self.capture.monitors[self.monitor_choice.current() + 1]
 
     def select_table(self):
         if self.counter.events:
             messagebox.showinfo('New shoe needed', 'Use Shuffle / New shoe before changing the table region.')
             return
         self.running = False
-        monitor = self.capture.monitors[0]
-        frame = np.array(self.capture.grab(monitor))[:, :, :3].copy()
-        box = self.select(frame, 'Select only the video table; Enter accepts, Esc cancels')
-        if box:
-            x, y, w, h = box
-            self.region = dict(left=monitor['left'] + x, top=monitor['top'] + y, width=w, height=h)
-            self.slots = []
-            self.gate.reset()
-            self.save()
-            self.status.set('Table selected. Add one tight rank-only position for each possible card location.')
+        # Let Windows reveal the browser before taking the selection screenshot.
+        self.window.withdraw()
+        self.window.after(400, self.finish_table_selection)
+
+    def finish_table_selection(self):
+        try:
+            monitor = self.selected_monitor()
+            frame = np.array(self.capture.grab(monitor))[:, :, :3].copy()
+            box = self.select(frame, 'Drag around browser video; Enter accepts, Esc cancels')
+            if box:
+                x, y, w, h = box
+                self.region = dict(left=monitor['left'] + x, top=monitor['top'] + y, width=w, height=h)
+                self.slots = []
+                self.gate.reset()
+                self.save()
+                self.status.set('Table preview is live. Move King away from the captured area. Add card positions to configure counting.')
+        except Exception as exc:
+            self.status.set(f'Could not select screen: {exc}')
+        finally:
+            self.window.deiconify()
 
     def add_slot(self):
         self.running = False
@@ -190,8 +225,8 @@ class App:
 
     def tick(self):
         try:
-            if self.region:
-                frame = self.grab()
+            if self.window.state() != 'withdrawn':
+                frame = self.grab() if self.region else np.array(self.capture.grab(self.selected_monitor()))[:, :, :3].copy()
                 try:
                     threshold = float(self.threshold.get())
                     if not 0.7 <= threshold <= 0.99:
@@ -200,7 +235,7 @@ class App:
                     self.running = False
                     threshold = 0.90
                     self.status.set('Enter a match threshold from 0.70 to 0.99.')
-                for i, (x, y, w, h) in enumerate(self.slots):
+                for i, (x, y, w, h) in enumerate(self.slots if self.region else []):
                     rank, score = recognize(frame[y:y+h, x:x+w], self.templates, threshold)
                     if self.running:
                         emitted = self.gate.observe(i, rank)
