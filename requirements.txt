@@ -1,4 +1,6 @@
 mss>=10,<11
 numpy>=2,<3
-opencv-python>=4.10,<5
+opencv-python-headless>=4.10,<6
 Pillow>=11,<13
+rapidocr==3.10.0
+onnxruntime>=1.23,<2
