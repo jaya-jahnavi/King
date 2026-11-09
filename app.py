@@ -1,6 +1,5 @@
 """King: calibrated screen capture card-counting prototype. Run: python app.py."""
 import csv
-import ctypes
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +14,7 @@ from PIL import Image, ImageTk
 
 from counting import Counter, RoundGate, RANKS
 from automatic import AutoReader, AutoTracker
+from displays import bounds, contains, physical_selection, capture_region, enable_dpi_awareness
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'calibration'
@@ -46,6 +46,7 @@ class App:
     def __init__(self, window):
         self.window = window
         self.capture = mss.mss()
+        self.monitors = [bounds(m) for m in self.capture.monitors[1:]]
         self.region = None
         self.slots = []
         self.templates = {}
@@ -67,11 +68,14 @@ class App:
         source = ttk.Frame(window, padding=8)
         source.pack(fill='x')
         ttk.Label(source, text='Screen:').pack(side='left')
-        self.monitor_names = [f'{i}: {m["width"]} × {m["height"]}'
-                              for i, m in enumerate(self.capture.monitors[1:], 1)]
-        self.monitor_choice = ttk.Combobox(source, values=self.monitor_names, state='readonly', width=24)
+        self.monitor_names = self.display_names()
+        self.monitor_choice = ttk.Combobox(source, values=self.monitor_names, state='readonly', width=38)
         self.monitor_choice.current(0)
         self.monitor_choice.pack(side='left', padx=8)
+        self.monitor_choice.bind('<<ComboboxSelected>>', self.change_display)
+        ttk.Button(source, text='Refresh screens', command=self.refresh_displays).pack(side='left', padx=4)
+        self.capture_info = tk.StringVar()
+        ttk.Label(window, textvariable=self.capture_info, padding=4, wraplength=1000).pack(fill='x')
         ttk.Checkbutton(source, text='Automatic card reading', variable=self.auto, command=self.change_mode).pack(side='left')
         ttk.Label(source, text='Select table to start automatic counting.').pack(side='left', padx=8)
         bar = ttk.Frame(window, padding=10)
@@ -102,8 +106,10 @@ class App:
             self.running = True
             self.status.set('Starting automatic reader for saved table region. Keep King outside the captured area.')
         self.refresh()
+        self.update_capture_info()
         window.protocol('WM_DELETE_WINDOW', self.close)
         window.after(200, self.tick)
+        window.after(3000, self.check_displays)
 
     def grab(self):
         return np.array(self.capture.grab(self.region))[:, :, :3].copy()
@@ -151,16 +157,85 @@ class App:
         ttk.Button(dialog, text='Use selected area', command=accept).pack(pady=8)
         dialog.grab_set()
         dialog.focus_force()
-        self.window.wait_window(dialog)
+        self.selecting = True
+        try:
+            self.window.wait_window(dialog)
+        finally:
+            self.selecting = False
         if not state['accepted']:
             return None
-        x, y, w, h = state['box']
-        left, top = round(x / scale), round(y / scale)
-        right, bottom = min(width, round((x+w) / scale)), min(height, round((y+h) / scale))
-        return left, top, right-left, bottom-top
+        return physical_selection(width, height, shown.shape[1], shown.shape[0], state['box'])
+
+    def display_names(self):
+        return [f'Display {i}: {m["width"]} × {m["height"]} at ({m["left"]}, {m["top"]})'
+                for i, m in enumerate(self.monitors, 1)]
 
     def selected_monitor(self):
-        return self.capture.monitors[self.monitor_choice.current() + 1]
+        index = self.monitor_choice.current()
+        if not 0 <= index < len(self.monitors):
+            raise ValueError('Choose a connected screen, or click Refresh screens')
+        return self.monitors[index]
+
+    def update_capture_info(self):
+        monitor = self.selected_monitor()
+        if self.region:
+            self.capture_info.set(f'Capturing table on {self.monitor_choice.get()}: '
+                                  f'{self.region["width"]} × {self.region["height"]} pixels. '
+                                  'Keep the video visible on that display; King can stay on another display.')
+        else:
+            self.capture_info.set(f'Previewing {self.monitor_choice.get()}. Click Select table to choose the video area.')
+
+    def reset_capture_source(self):
+        self.running = False
+        self.invalidate()
+        self.region = None
+        self.slots = []
+        self.gate.reset()
+        self.tracker.reset()
+        self.detections = []
+
+    def change_display(self, event=None):
+        self.reset_capture_source()
+        self.update_capture_info()
+        self.save()
+        self.status.set('Screen changed; preview now shows the chosen display. Select table again. '
+                        'Shoe count retained; resume on a fresh round to avoid recounting old cards.')
+
+    def refresh_displays(self, quiet=False):
+        replacement = None
+        try:
+            replacement = mss.mss()
+            monitors = [bounds(m) for m in replacement.monitors[1:]]
+            if not monitors:
+                raise OSError('No connected displays detected')
+            previous = self.selected_monitor()
+            changed = monitors != self.monitors
+            self.capture.close()
+            self.capture, replacement = replacement, None
+            if changed:
+                self.monitors = monitors
+                self.monitor_names = self.display_names()
+                self.monitor_choice.configure(values=self.monitor_names)
+                self.monitor_choice.current(monitors.index(previous) if previous in monitors else 0)
+                self.reset_capture_source()
+                self.update_capture_info()
+                self.save()
+                self.status.set('Display layout changed. Capture paused and old crop cleared. '
+                                'Choose the video screen and Select table again. Shoe count retained; resume on a fresh round.')
+            elif not quiet:
+                self.status.set('Screens refreshed. Choose the display containing the video, then Select table.')
+        except Exception as exc:
+            self.running = False
+            self.invalidate()
+            self.status.set(f'Cannot refresh screens: {exc}')
+        finally:
+            if replacement is not None:
+                replacement.close()
+
+    def check_displays(self):
+        if self.window.state() != 'withdrawn' and not getattr(self, 'selecting', False):
+            self.refresh_displays(quiet=True)
+        self.window.after(3000, self.check_displays)
 
     def invalidate(self):
         self.generation += 1
@@ -176,9 +251,7 @@ class App:
         return self.reader.detect(frame)
 
     def select_table(self):
-        if self.counter.events:
-            messagebox.showinfo('New shoe needed', 'Use Shuffle / New shoe before changing the table region.')
-            return
+        self.refresh_displays(quiet=True)
         self.running = False
         self.invalidate()
         # Let Windows reveal the browser before taking the selection screenshot.
@@ -192,14 +265,18 @@ class App:
             box = self.select(frame, 'Drag around browser video; Enter accepts, Esc cancels')
             if box:
                 x, y, w, h = box
-                self.region = dict(left=monitor['left'] + x, top=monitor['top'] + y, width=w, height=h)
+                self.region = capture_region(monitor, box)
                 self.slots = []
                 self.gate.reset()
                 self.tracker.reset()
                 self.detections = []
                 self.save()
-                self.running = self.auto.get()
-                self.status.set('Automatic reader starting. Keep King outside the table crop.' if self.running else 'Table selected. Configure manual positions or enable automatic reading.')
+                self.running = self.auto.get() and not self.counter.events
+                self.update_capture_info()
+                if self.counter.events:
+                    self.status.set('Table selected; shoe count retained. Wait for a fresh round before pressing Start to avoid recounting existing cards.')
+                else:
+                    self.status.set('Automatic reader starting. Keep King outside the table crop.' if self.running else 'Table selected. Configure manual positions or enable automatic reading.')
         except Exception as exc:
             self.status.set(f'Could not select screen: {exc}')
         finally:
@@ -360,7 +437,8 @@ class App:
 
     def save(self):
         DATA.mkdir(exist_ok=True)
-        (DATA / 'layout.json').write_text(json.dumps(dict(region=self.region, slots=self.slots)), encoding='utf-8')
+        (DATA / 'layout.json').write_text(json.dumps(dict(region=self.region, slots=self.slots,
+                                                       monitor=self.selected_monitor(), monitor_layout=self.monitors)), encoding='utf-8')
 
     def load(self):
         path = DATA / 'layout.json'
@@ -369,12 +447,22 @@ class App:
                 layout = json.loads(path.read_text(encoding='utf-8'))
                 region = layout['region']
                 slots = layout['slots']
-                if not region or region['width'] <= 0 or region['height'] <= 0:
-                    raise ValueError('Invalid region')
-                for x, y, w, h in slots:
-                    if min(x, y) < 0 or min(w, h) <= 0 or x+w > region['width'] or y+h > region['height']:
-                        raise ValueError('Invalid card position')
-                self.region, self.slots = region, slots
+                saved_monitor = layout.get('monitor')
+                if layout.get('monitor_layout', self.monitors) != self.monitors:
+                    raise ValueError('Display arrangement changed; choose the video screen and Select table again')
+                if saved_monitor is None and region:
+                    saved_monitor = next((m for m in self.monitors if contains(m, region)), None)
+                if saved_monitor is not None:
+                    if saved_monitor not in self.monitors:
+                        raise ValueError('Saved screen is disconnected; select another screen')
+                    self.monitor_choice.current(self.monitors.index(saved_monitor))
+                if region:
+                    if not contains(self.selected_monitor(), region):
+                        raise ValueError('Saved crop is outside the selected screen')
+                    for x, y, w, h in slots:
+                        if min(x, y) < 0 or min(w, h) <= 0 or x+w > region['width'] or y+h > region['height']:
+                            raise ValueError('Invalid card position')
+                    self.region, self.slots = region, slots
             for rank in RANKS:
                 template = cv2.imread(str(DATA / f'{rank}.png')) if (DATA / f'{rank}.png').exists() else None
                 if template is not None:
@@ -399,8 +487,5 @@ class App:
 
 
 if __name__ == '__main__':
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except (AttributeError, OSError):
-        pass
+    enable_dpi_awareness()
     App(tk.Tk()).window.mainloop()
