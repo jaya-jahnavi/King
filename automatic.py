@@ -36,8 +36,11 @@ class AutoTracker:
     def reset(self):
         self.tracks = []
         self.empty_since = None
+        self.round_ended = False
+        self.clear_confirmed = False
 
     def update(self, detections, now):
+        self.round_ended = False
         if not detections:
             for track in self.tracks:
                 if not track.counted:
@@ -46,8 +49,11 @@ class AutoTracker:
                 self.empty_since = now
             if now - self.empty_since >= self.clear_seconds:
                 self.tracks.clear()
+                self.round_ended = not self.clear_confirmed
+                self.clear_confirmed = True
             return []
         self.empty_since = None
+        self.clear_confirmed = False
         # One-to-one nearest association: two identical ranks are distinct cards.
         pairs = []
         for di, detection in enumerate(detections):
