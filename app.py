@@ -316,7 +316,10 @@ class App:
                                 self.counter.add(detection.rank, f'auto OCR ({detection.score:.2f})')
                                 self.refresh()
                             readable = sum(bool(d.rank) for d in detected)
-                            self.status.set(f'Automatic counting active: {len(detected)} card shapes, {readable} readable ranks. Clear table 3 seconds between hands; reset at shuffle.')
+                            if not readable:
+                                self.status.set(f'No card ranks recognized ({len(detected)} candidate shapes). The displayed count is unverified and may be incomplete. Crop to the main tabletop; small, tilted or overlapping cards may require a different detector.')
+                            else:
+                                self.status.set(f'Tracking {readable} readable ranks in {len(detected)} candidate shapes. Count includes recognized cards only; verify that every exposed card is labeled. Reset at shuffle.')
                 if self.running and self.auto.get() and self.region and self.future is None:
                     self.pending_generation, self.pending_time = self.generation, time.monotonic()
                     self.future = self.worker.submit(self.read_auto, frame.copy())
