@@ -48,11 +48,13 @@ def recognize(crop, templates, threshold):
 class App:
     def __init__(self, window):
         self.window = window
+        self.closed = False
         self.capture = mss.mss()
         self.monitors = [bounds(m) for m in self.capture.monitors[1:]]
         self.region = None
         self.layout_problem = None
         self.slots = []
+        self.calibrating = False
         self.templates = {}
         self.counter = Counter()
         self.gate = RoundGate()
@@ -107,13 +109,14 @@ class App:
         self.invalidate()
         self.vision_gate.confirmations = 1 if self.speed.get().startswith('Fast') else 2
         self.vision_gate.pending, self.vision_gate.hits = None, 0
-        self.mode_hint.set(('One AI read · less verification' if self.vision_gate.confirmations == 1 else 'Two agreeing AI reads')
-                           if self.backend.get() == 'OpenAI' else 'Local OCR · 3 matching frames')
+        self.update_mode_hint()
         self.next_api_at = 0
         self.status.set('Speed selected. Fast counts use one AI read and can include recognition errors. Press Start when ready.'
                         if self.vision_gate.confirmations == 1 else 'Verified mode waits for two agreeing complete reads. Press Start when ready.')
 
     def update_activity(self):
+        if self.closed:
+            return
         now = time.monotonic()
         if self.future is not None and not self.future.done():
             self.activity.set(f'Reading image… {now-self.pending_time:.1f}s · count below is the last completed update' if self.running
@@ -125,6 +128,68 @@ class App:
             self.activity.set('Paused · saved counts remain visible')
         self.start_label.set('Pause counting' if self.running else '3  Start counting')
         self.window.after(100, self.update_activity)
+
+    def update_mode_hint(self):
+        if not self.auto.get():
+            self.mode_hint.set('Manual positions · 4 matching frames')
+        elif self.backend.get() == 'OpenAI':
+            self.mode_hint.set('One AI read · less verification' if self.vision_gate.confirmations == 1 else 'Two agreeing AI reads')
+        else:
+            self.mode_hint.set('Local OCR · 3 matching frames')
+
+    def refresh_calibration(self):
+        missing = [rank for rank in RANKS if rank not in self.templates]
+        mode = 'Manual position reading' if not self.auto.get() else f'{self.backend.get()} automatic reading — positions not used'
+        self.calibration_info.set(f'{mode}\n{len(self.slots)} saved position(s) · {len(self.templates)}/13 rank templates. '
+                                  + ('Missing: '+', '.join(missing) if missing else 'All templates ready.'))
+        selected = self.position_table.selection()
+        self.position_table.delete(*self.position_table.get_children())
+        for i,(x,y,w,h) in enumerate(self.slots):
+            self.position_table.insert('', 'end', iid=str(i), values=(i+1,x,y,w,h))
+        if selected and self.position_table.exists(selected[0]):
+            self.position_table.selection_set(selected[0])
+
+    def calibration_notice(self, text):
+        self.status.set(text)
+        self.calibration_message.set(text)
+
+    def activate_manual_positions(self):
+        self.auto.set(False)
+        self.backend.set('Local OCR')
+        self.change_mode()
+        self.gate.reset()
+
+    def use_positions(self):
+        if not self.region or not self.slots:
+            self.calibration_notice('Choose the video area and add at least one card position first.')
+            return
+        self.activate_manual_positions()
+        try:
+            self.save()
+        except OSError:
+            return self.calibration_notice('Manual mode selected, but settings could not be saved.')
+        self.notebook.select(0)
+        missing = [rank for rank in RANKS if rank not in self.templates]
+        self.calibration_notice('Manual positions selected. '+('Save missing templates before Start: '+', '.join(missing)
+                                if missing else 'All templates ready. Press Start on a fresh round.'))
+
+    def remove_slot(self):
+        selected = self.position_table.selection()
+        if not selected:
+            return self.calibration_notice('Select a position in the list before removing it.')
+        self.running = False
+        self.invalidate()
+        old = list(self.slots)
+        del self.slots[int(selected[0])]
+        try:
+            self.save()
+        except OSError:
+            self.slots = old
+            return self.calibration_notice('Position could not be removed from saved settings.')
+        self.gate.reset()
+        self.resume_requires_fresh_round = bool(self.counter.round_cards)
+        self.refresh_calibration()
+        self.calibration_notice('Position removed; counting paused. Resume on a fresh round if cards were already counted.')
 
     def load_session(self):
         path = DATA / 'session.json'
@@ -329,6 +394,7 @@ class App:
                                   'Keep the video visible on that display; King can stay on another display.')
         else:
             self.capture_info.set(f'Previewing {self.monitor_choice.get()}. Click Select table to choose the video area.')
+        self.refresh_calibration()
 
     def reset_capture_source(self):
         self.running = False
@@ -341,6 +407,7 @@ class App:
         self.vision_gate.reset()
         self.test_frame = None
         self.resume_requires_fresh_round = bool(self.counter.round_cards)
+        self.calibration_message.set('Video source changed. Choose the video area, then add card positions if using manual reading.')
 
     def change_display(self, event=None):
         self.reset_capture_source()
@@ -381,7 +448,9 @@ class App:
                 replacement.close()
 
     def check_displays(self):
-        if self.window.state() != 'withdrawn' and not getattr(self, 'selecting', False):
+        if self.closed:
+            return
+        if self.window.state() != 'withdrawn' and not getattr(self, 'selecting', False) and not self.calibrating:
             self.refresh_displays(quiet=True)
         self.window.after(3000, self.check_displays)
 
@@ -397,11 +466,20 @@ class App:
         self.test_frame = None
         self.next_api_at = 0
         self.resume_requires_fresh_round = bool(self.counter.round_cards)
-        self.mode_hint.set(('One AI read · less verification' if self.vision_gate.confirmations == 1 else 'Two agreeing AI reads')
-                           if self.backend.get() == 'OpenAI' else 'Local OCR · 3 matching frames')
+        self.update_mode_hint()
         self.status.set('Reader changed; paused. Test OpenAI on a recording first. If cards were already counted, resume on a fresh round to avoid recounting.')
         self.api_info.set(f'OpenAI uploads cropped images and incurs charges. {self.api_calls} requests started this session; key is kept in memory.'
                           if self.backend.get() == 'OpenAI' else 'Local OCR selected. No new OpenAI requests; any in-flight request may still finish.')
+        self.refresh_calibration()
+        if self.region:
+            try:
+                self.save()
+            except OSError:
+                self.calibration_notice('Reader changed for this session, but the mode setting could not be saved.')
+
+    def change_provider(self, event=None):
+        self.auto.set(True)
+        self.change_mode()
 
     def set_api_key(self):
         self.running = False
@@ -559,6 +637,7 @@ class App:
                 self.save()
                 self.running = False
                 self.update_capture_info()
+                self.calibration_message.set('Video area updated. Add a tight rank-only position, then save the rank templates for manual reading.')
                 if self.counter.events:
                     self.status.set('Table selected; shoe count retained. Wait for a fresh round before pressing Start to avoid recounting existing cards.')
                 elif self.auto.get() and self.backend.get() == 'OpenAI' and not self.api_key:
@@ -571,38 +650,71 @@ class App:
             self.window.deiconify()
 
     def add_slot(self):
-        self.running = False
-        if not self.region:
-            return self.status.set('Select a table first.')
-        box = self.select(self.grab(), 'Select a tight upright rank-only box; exclude suit; Enter accepts')
-        if box:
-            self.slots.append(box)
-            self.save()
-            self.status.set(f'Added position {len(self.slots)}. Keep every position tightly aligned to its rank.')
+        self.begin_calibration('position')
 
     def template(self):
+        self.begin_calibration('template')
+
+    def begin_calibration(self, task):
+        if self.calibrating:
+            return
         self.running = False
+        self.invalidate()
+        self.test_frame = None
         if not self.region:
-            return self.status.set('Select a table first.')
-        frame = self.grab()
-        box = self.select(frame, 'Select a visible upright rank only, same padding as card positions')
-        if not box:
-            return
-        rank = simpledialog.askstring('Rank', 'Rank: 2–10, J, Q, K, A', parent=self.window)
-        if rank is None:
-            return
-        rank = rank.strip().upper()
-        if rank not in RANKS:
-            return messagebox.showerror('Invalid rank', 'Enter 2–10, J, Q, K, or A.')
-        x, y, w, h = box
-        patch = frame[y:y+h, x:x+w]
-        if normalized(patch).std() < 12:
-            return messagebox.showerror('Empty template', 'Select a clearly visible rank with contrasting strokes.')
-        DATA.mkdir(exist_ok=True)
-        if not cv2.imwrite(str(DATA / f'{rank}.png'), patch):
-            raise OSError('Could not save template')
-        self.templates[rank] = normalized(patch)
-        self.status.set(f'Saved {rank}. Templates: {len(self.templates)}/13. Capture every rank before Start.')
+            return self.calibration_notice('Choose the video area first. No position or template was added.')
+        self.calibrating = True
+        self.window.withdraw()
+        self.window.after(350, lambda: self.finish_calibration(task))
+
+    def finish_calibration(self, task):
+        try:
+            frame = self.grab()
+            box = self.select(frame, 'Drag a tight box around ONE upright rank only; Enter accepts; Esc cancels')
+            if self.closed:
+                return
+            if not box:
+                return self.calibration_notice('Selection canceled. Saved positions and templates unchanged.')
+            x,y,w,h = box
+            if min(x,y)<0 or min(w,h)<=2 or x+w>frame.shape[1] or y+h>frame.shape[0]:
+                return self.calibration_notice('Choose a nonempty rank box inside the video area.')
+            self.window.deiconify()
+            if task == 'position':
+                if tuple(box) in [tuple(slot) for slot in self.slots]:
+                    return self.calibration_notice('That exact position is already saved. Use these positions to activate it.')
+                self.activate_manual_positions()
+                self.slots.append(tuple(box))
+                try:
+                    self.save()
+                except OSError:
+                    self.slots.pop()
+                    raise
+                self.calibration_notice(f'Position {len(self.slots)} saved and manual reading selected. Save all 13 rank templates, then Show on live preview.')
+            else:
+                rank = simpledialog.askstring('Label this rank template', 'Rank: 2–10, J, Q, K, A', parent=self.window)
+                if rank is None:
+                    return self.calibration_notice('Template label canceled. Templates unchanged.')
+                rank = rank.strip().upper()
+                if rank not in RANKS:
+                    return self.calibration_notice('Invalid rank label. Use 2–10, J, Q, K or A.')
+                patch = frame[y:y+h,x:x+w]
+                if normalized(patch).std()<12:
+                    return self.calibration_notice('That box is nearly blank. Select the visible rank and some contrasting background.')
+                DATA.mkdir(exist_ok=True)
+                if not cv2.imwrite(str(DATA/f'{rank}.png'),patch):
+                    raise OSError('Could not save template')
+                self.templates[rank] = normalized(patch)
+                self.activate_manual_positions()
+                self.save()
+                self.calibration_notice(f'{rank} template saved. {len(self.templates)}/13 ranks ready; counting remains paused.')
+        except (OSError, ValueError, cv2.error) as exc:
+            self.calibration_notice(f'Calibration failed: {exc}')
+        finally:
+            self.calibrating = False
+            if not self.closed:
+                self.window.deiconify()
+                self.notebook.select(self.calibration_tab)
+                self.refresh_calibration()
 
     def toggle(self):
         if not self.running:
@@ -707,6 +819,8 @@ class App:
         self.save_session()
 
     def tick(self):
+        if self.closed:
+            return
         try:
             if self.window.state() != 'withdrawn':
                 if self.test_frame is not None and not self.running:
@@ -765,20 +879,23 @@ class App:
                         label = f'{detection.rank or "?"} AI' if self.backend.get() == 'OpenAI' else f'{detection.rank or "?"} {detection.score:.2f}'
                         cv2.putText(frame, label, (x, max(16, y-5)),
                                     cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2)
-                try:
-                    threshold = float(self.threshold.get())
-                    if not 0.7 <= threshold <= 0.99:
-                        raise ValueError('Match threshold must be 0.70–0.99')
-                except (ValueError, tk.TclError):
-                    self.running = False
-                    threshold = 0.90
-                    self.status.set('Enter a match threshold from 0.70 to 0.99.')
+                threshold = 0.90
+                if self.region and not self.auto.get():
+                    try:
+                        threshold = float(self.threshold.get())
+                        if not 0.7 <= threshold <= 0.99:
+                            raise ValueError('Match threshold must be 0.70–0.99')
+                    except (ValueError, tk.TclError):
+                        self.running = False
+                        self.calibration_notice('Enter a manual match threshold from 0.70 to 0.99.')
                 for i, (x, y, w, h) in enumerate(self.slots if self.region and not self.auto.get() else []):
                     rank, score = recognize(frame[y:y+h, x:x+w], self.templates, threshold)
+                    self.last_read_at = time.monotonic()
                     if self.running:
                         emitted = self.gate.observe(i, rank)
                         if emitted:
                             self.counter.add(emitted, f'position {i+1} ({score:.2f})')
+                            self.last_count_at = time.monotonic()
                             self.refresh()
                     color = (70, 210, 70) if i in self.gate.locked else (0, 180, 255)
                     cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
@@ -791,12 +908,15 @@ class App:
         except Exception as exc:
             self.running = False
             self.status.set(str(exc) if isinstance(exc, VisionError) else f'Capture paused: {exc}')
-        self.window.after(80, self.tick)
+        if not self.closed:
+            self.window.after(80, self.tick)
 
     def save(self):
         DATA.mkdir(exist_ok=True)
-        (DATA / 'layout.json').write_text(json.dumps(dict(region=self.region, slots=self.slots,
-                                                       monitor=self.selected_monitor(), monitor_layout=self.monitors)), encoding='utf-8')
+        temporary = DATA / 'layout.tmp'
+        temporary.write_text(json.dumps(dict(region=self.region, slots=self.slots, manual_positions=not self.auto.get(), reader=self.backend.get(),
+                                            monitor=self.selected_monitor(), monitor_layout=self.monitors)), encoding='utf-8')
+        temporary.replace(DATA / 'layout.json')
 
     def load(self):
         path = DATA / 'layout.json'
@@ -821,6 +941,14 @@ class App:
                         if min(x, y) < 0 or min(w, h) <= 0 or x+w > region['width'] or y+h > region['height']:
                             raise ValueError('Invalid card position')
                     self.region, self.slots = region, slots
+                    if layout.get('reader') in ('OpenAI','Local OCR'):
+                        self.backend.set(layout['reader'])
+                    manual = layout.get('manual_positions', False)
+                    if type(manual) is not bool:
+                        raise ValueError('Invalid saved reading mode')
+                    self.auto.set(not manual)
+                    if manual:
+                        self.backend.set('Local OCR')
             for rank in RANKS:
                 template = cv2.imread(str(DATA / f'{rank}.png')) if (DATA / f'{rank}.png').exists() else None
                 if template is not None:
@@ -841,11 +969,16 @@ class App:
                                      row['round_count'], row['running_count'], row['state'], row['first_card_at'], row['last_card_at']])
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         self.running = False
         self.save_session()
         self.api_key = ''
         self.worker.shutdown(wait=False, cancel_futures=True)
         self.capture.close()
+        for callback in self.window.tk.call('after','info'):
+            self.window.after_cancel(callback)
         self.window.destroy()
 
 
