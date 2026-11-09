@@ -48,6 +48,18 @@ To replace the layout, reset the shoe and select the table again. Existing templ
 
 ## Checks
 
+The supplied live-dealer recording exposed a real-stream failure: the current pipeline recognized no ranks in six sampled frames, using both the complete screen and a main-table crop. Synthetic tests passing does **not** establish that this reader works on live-dealer footage. The app now explicitly warns when no ranks are recognized. Do not interpret an unchanged displayed count as a verified zero.
+
+To reproduce recognition on a local recording without opening the live screen:
+
+```powershell
+python audit_video.py recording.mp4 --samples 12 --output recognition-audit.json
+# Optional main-table crop: X Y WIDTH HEIGHT in recording pixels
+python audit_video.py recording.mp4 --region 680 680 640 210 --output recognition-audit.json
+```
+
+The audit samples frames and records candidate shapes and readable ranks. It does not add repeated sightings to a shoe count, measure accuracy without ground truth, or upload footage. Keep the dealer's duplicate digital overlay outside the selected table region. The current reader remains unsuitable for a reliable count on the supplied stream; a validated replacement detector is still required.
+
 ```powershell
 python -m unittest discover -s tests -v
 python -m compileall -q app.py counting.py
