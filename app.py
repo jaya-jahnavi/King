@@ -1,6 +1,7 @@
 """King: calibrated screen capture card-counting prototype. Run: python app.py."""
 import csv
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -15,6 +16,7 @@ from PIL import Image, ImageTk
 from counting import Counter, RoundGate, RANKS
 from automatic import AutoReader, AutoTracker
 from displays import bounds, contains, physical_selection, capture_region, enable_dpi_awareness
+from openai_vision import OpenAIReader, VisionGate, VisionError, DEFAULT_MODEL
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'calibration'
@@ -60,6 +62,17 @@ class App:
         self.future = None
         self.generation = 0
         self.detections = []
+        self.backend = tk.StringVar(value='Local OCR')
+        self.api_model = tk.StringVar(value=DEFAULT_MODEL)
+        self.api_key = os.environ.get('OPENAI_API_KEY', '').strip()
+        self.api_interval = tk.DoubleVar(value=2)
+        self.api_limit = tk.IntVar(value=60)
+        self.api_calls = 0
+        self.api_tokens = [0, 0]
+        self.next_api_at = 0
+        self.vision_gate = VisionGate()
+        self.test_frame = None
+        self.api_info = tk.StringVar(value='Local OCR selected. OpenAI mode sends the selected table crop to OpenAI and incurs API charges.')
         self.status = tk.StringVar(value='Screen preview is live. Select the screen containing your browser, then click Select table.')
         self.stats = tk.StringVar()
         self.threshold = tk.DoubleVar(value=0.90)
@@ -78,6 +91,22 @@ class App:
         ttk.Label(window, textvariable=self.capture_info, padding=4, wraplength=1000).pack(fill='x')
         ttk.Checkbutton(source, text='Automatic card reading', variable=self.auto, command=self.change_mode).pack(side='left')
         ttk.Label(source, text='Select table to start automatic counting.').pack(side='left', padx=8)
+        cloud = ttk.Frame(window, padding=6)
+        cloud.pack(fill='x')
+        ttk.Label(cloud, text='Reader:').pack(side='left')
+        provider = ttk.Combobox(cloud, textvariable=self.backend, values=['Local OCR', 'OpenAI'], state='readonly', width=11)
+        provider.pack(side='left', padx=4)
+        provider.bind('<<ComboboxSelected>>', self.change_mode)
+        model = ttk.Combobox(cloud, textvariable=self.api_model, values=[DEFAULT_MODEL, 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'], state='readonly', width=18)
+        model.pack(side='left', padx=4)
+        model.bind('<<ComboboxSelected>>', self.change_mode)
+        ttk.Button(cloud, text='Set API key', command=self.set_api_key).pack(side='left', padx=3)
+        ttk.Button(cloud, text='Test recording (1 call)', command=self.test_recording).pack(side='left', padx=3)
+        ttk.Label(cloud, text=' Min seconds:').pack(side='left')
+        ttk.Spinbox(cloud, from_=1, to=30, textvariable=self.api_interval, width=4).pack(side='left')
+        ttk.Label(cloud, text=' Call limit:').pack(side='left')
+        ttk.Spinbox(cloud, from_=1, to=1000, textvariable=self.api_limit, width=5).pack(side='left')
+        ttk.Label(window, textvariable=self.api_info, wraplength=1000, padding=4).pack(fill='x')
         bar = ttk.Frame(window, padding=10)
         bar.pack(fill='x')
         for label, command in [('Select table', self.select_table), ('Add card position', self.add_slot),
@@ -193,6 +222,8 @@ class App:
         self.gate.reset()
         self.tracker.reset()
         self.detections = []
+        self.vision_gate.reset()
+        self.test_frame = None
 
     def change_display(self, event=None):
         self.reset_capture_source()
@@ -240,10 +271,134 @@ class App:
     def invalidate(self):
         self.generation += 1
 
-    def change_mode(self):
+    def change_mode(self, event=None):
         self.running = False
         self.invalidate()
-        self.status.set('Mode changed. Press Start to continue. Automatic mode needs no templates or card positions.')
+        self.vision_gate.reset()
+        self.tracker.reset()
+        self.detections = []
+        self.test_frame = None
+        self.next_api_at = 0
+        self.status.set('Reader changed; paused. Test OpenAI on a recording first. If cards were already counted, resume on a fresh round to avoid recounting.')
+        self.api_info.set(f'OpenAI uploads cropped images and incurs charges. {self.api_calls} requests started this session; key is kept in memory.'
+                          if self.backend.get() == 'OpenAI' else 'Local OCR selected. No new OpenAI requests; any in-flight request may still finish.')
+
+    def set_api_key(self):
+        self.running = False
+        self.invalidate()
+        key = simpledialog.askstring('OpenAI API key — local session only',
+                                     'Enter your API key here, not in chat. It stays in memory until King closes.\n'
+                                     'OpenAI mode uploads the selected table crop and incurs API charges.',
+                                     show='*', parent=self.window)
+        if key is None or not key.strip():
+            return False
+        self.api_key = key.strip()
+        self.backend.set('OpenAI')
+        self.auto.set(True)
+        self.change_mode()
+        self.api_info.set('Key set for this session; not yet validated. Test recording makes one paid image request. No key is saved to disk.')
+        return True
+
+    def ensure_api_key(self):
+        return bool(self.api_key) or self.set_api_key()
+
+    def cloud_settings(self):
+        try:
+            interval, limit = float(self.api_interval.get()), int(self.api_limit.get())
+        except (ValueError, tk.TclError):
+            raise VisionError('Enter a request interval (1–30 seconds) and call limit (1–1000).') from None
+        if not 1 <= interval <= 30 or not 1 <= limit <= 1000:
+            raise VisionError('Enter a request interval (1–30 seconds) and call limit (1–1000).')
+        if self.api_calls >= limit:
+            raise VisionError('OpenAI call limit reached. Counting paused. Increase Call limit only if you want more paid requests.')
+        return interval, limit
+
+    def submit_cloud(self, frame, task='live'):
+        interval, limit = self.cloud_settings()
+        reader = OpenAIReader(self.api_key, self.api_model.get())
+        self.pending_generation, self.pending_time = self.generation, time.monotonic()
+        self.pending_backend, self.pending_task = 'OpenAI', task
+        self.api_calls += 1
+        self.next_api_at = self.pending_time+interval
+        self.api_info.set(f'OpenAI {self.api_calls}/{limit} requests started; image processing. Selected table crop sent to OpenAI. Pause stops new requests.')
+        self.future = self.worker.submit(reader.read, frame.copy())
+
+    def test_recording(self):
+        self.running = False
+        self.invalidate()
+        if self.future is not None:
+            return self.status.set('Wait for the current reader request to finish, then click Test recording again.')
+        if not self.ensure_api_key():
+            return
+        self.backend.set('OpenAI')
+        self.auto.set(True)
+        self.change_mode()
+        filename = filedialog.askopenfilename(title='Choose a recording or image — one paid OpenAI request',
+                                              filetypes=[('Video or image', '*.mp4 *.mkv *.avi *.mov *.png *.jpg *.jpeg'), ('All files', '*.*')])
+        if not filename:
+            return
+        try:
+            if Path(filename).suffix.lower() in ('.png', '.jpg', '.jpeg'):
+                frame = cv2.imread(filename)
+            else:
+                video = cv2.VideoCapture(filename)
+                try:
+                    fps, frames = video.get(cv2.CAP_PROP_FPS), video.get(cv2.CAP_PROP_FRAME_COUNT)
+                    duration = max(0, (frames-1)/fps) if fps > 0 else 0
+                    seconds = simpledialog.askfloat('Choose test frame', f'Seconds into recording (0–{duration:.1f}):',
+                                                    initialvalue=min(60, duration), minvalue=0, maxvalue=duration, parent=self.window)
+                    if seconds is None:
+                        return
+                    video.set(cv2.CAP_PROP_POS_MSEC, seconds*1000)
+                    ok, frame = video.read()
+                    if not ok:
+                        frame = None
+                finally:
+                    video.release()
+            if frame is None:
+                raise VisionError('Could not read that recording or image.')
+            box = self.select(frame, 'Select MAIN tabletop only; exclude duplicate dealer overlay')
+            if not box:
+                return
+            x, y, w, h = box
+            self.test_frame = frame[y:y+h, x:x+w].copy()
+            self.detections = []
+            self.submit_cloud(self.test_frame, task='test')
+            self.status.set('Testing one cropped frame with OpenAI. This test does not change the shoe count.')
+        except (VisionError, cv2.error) as exc:
+            self.status.set(str(exc) if isinstance(exc, VisionError) else 'Could not decode the selected frame.')
+
+    def consume_cloud(self, observation, task, captured_at):
+        age = time.monotonic()-captured_at
+        self.api_tokens[0] += observation.input_tokens
+        self.api_tokens[1] += observation.output_tokens
+        self.api_info.set(f'OpenAI: {self.api_calls} requests started | last request {observation.latency:.1f}s | '
+                          f'image age {age:.1f}s | tokens used {self.api_tokens[0]} input / {self.api_tokens[1]} output. API charges apply.')
+        self.detections = observation.cards
+        if task == 'test':
+            ranks = [d.rank for d in observation.cards if d.rank]
+            total = sum(1 if r in RANKS[:5] else -1 if r in RANKS[8:] else 0 for r in ranks)
+            self.status.set(f'Test only: {len(ranks)} readable cards, visible-set Hi-Lo {total:+d}; '
+                            f'table {observation.table_state}, complete={observation.complete}. Shoe count unchanged.')
+            messagebox.showinfo('OpenAI frame test — verify against the recording',
+                                f'Readable cards: {len(ranks)}\nRanks: {", ".join(ranks) or "none"}\n'
+                                f'Visible-set Hi-Lo: {total:+d}\nModel reports complete: {observation.complete}\n'
+                                f'Request time: {observation.latency:.1f}s\n\n'
+                                'This is one frame, not the shoe count. Check every card and duplicate corner before live use.', parent=self.window)
+            return
+        if age > 30:
+            self.running = False
+            self.detections = []
+            self.status.set('OpenAI result is over 30 seconds old; live counting paused without applying it.')
+            return
+        added = self.vision_gate.update(observation, captured_at)
+        if len(self.counter.events)+len(added) > self.counter.decks*52:
+            raise VisionError('Shoe exhausted; reset after the shuffle. No cards from this observation were added.')
+        for rank in added:
+            self.counter.add(rank, f'OpenAI ({age:.1f}s image age)')
+        if added:
+            self.refresh()
+        self.status.set(self.vision_gate.note)
 
     def read_auto(self, frame):
         if self.reader is None:
@@ -269,12 +424,16 @@ class App:
                 self.slots = []
                 self.gate.reset()
                 self.tracker.reset()
+                self.vision_gate.reset()
+                self.test_frame = None
                 self.detections = []
                 self.save()
-                self.running = self.auto.get() and not self.counter.events
+                self.running = self.auto.get() and not self.counter.events and (self.backend.get() != 'OpenAI' or bool(self.api_key))
                 self.update_capture_info()
                 if self.counter.events:
                     self.status.set('Table selected; shoe count retained. Wait for a fresh round before pressing Start to avoid recounting existing cards.')
+                elif self.auto.get() and self.backend.get() == 'OpenAI' and not self.api_key:
+                    self.status.set('Table selected. Click Set API key, then Test recording or Start for OpenAI image recognition.')
                 else:
                     self.status.set('Automatic reader starting. Keep King outside the table crop.' if self.running else 'Table selected. Configure manual positions or enable automatic reading.')
         except Exception as exc:
@@ -326,14 +485,26 @@ class App:
                 missing = set(RANKS) - self.templates.keys()
                 if missing:
                     return self.status.set('Missing templates: ' + ', '.join(r for r in RANKS if r in missing))
+            elif self.backend.get() == 'OpenAI':
+                if not self.ensure_api_key():
+                    return
+                try:
+                    self.cloud_settings()
+                except VisionError as exc:
+                    return self.status.set(str(exc))
+            self.test_frame = None
+            self.detections = []
         self.running = not self.running
         self.invalidate()
         self.status.set('Capturing. Keep the stream visible and this app outside the captured region.' if self.running else 'Paused.')
+        if not self.running and self.backend.get() == 'OpenAI':
+            self.api_info.set(f'Paused after {self.api_calls} requests started. No new image requests; an in-flight request may finish and incur charges.')
 
     def next_round(self):
         self.running = False
         self.gate.reset()
         self.tracker.reset()
+        self.vision_gate.reset()
         self.invalidate()
         self.status.set('Card tracking reset; shoe count retained. Wait for old cards to clear, then press Start.')
 
@@ -345,6 +516,7 @@ class App:
             self.counter = Counter(decks)
             self.gate.reset()
             self.tracker.reset()
+            self.vision_gate.reset()
             self.invalidate()
             self.refresh()
             self.status.set('New shoe ready. Start counting from the beginning of the shoe.')
@@ -376,18 +548,29 @@ class App:
     def tick(self):
         try:
             if self.window.state() != 'withdrawn':
-                frame = self.grab() if self.region else np.array(self.capture.grab(self.selected_monitor()))[:, :, :3].copy()
+                if self.test_frame is not None and not self.running:
+                    frame = self.test_frame.copy()
+                else:
+                    frame = self.grab() if self.region else np.array(self.capture.grab(self.selected_monitor()))[:, :, :3].copy()
                 if self.future is not None and self.future.done():
                     pending, generation, captured_at = self.future, self.pending_generation, self.pending_time
+                    backend = getattr(self, 'pending_backend', 'Local OCR')
+                    task = getattr(self, 'pending_task', 'live')
                     self.future = None
                     try:
                         detected = pending.result()
                     except Exception as exc:
-                        if self.running and generation == self.generation:
+                        if generation == self.generation and (self.running or task == 'test'):
                             self.running = False
-                            self.status.set(f'Automatic reader unavailable: {exc}. Run pip install -r requirements.txt, then restart.')
+                            if backend == 'OpenAI':
+                                self.status.set(str(exc) if isinstance(exc, VisionError) else 'OpenAI reader failed. No count changed; check setup and try again.')
+                                self.api_info.set(f'OpenAI: {self.api_calls} requests started. Last request failed; no automatic retry. API usage may still be billed.')
+                            else:
+                                self.status.set(f'Automatic reader unavailable: {exc}. Run pip install -r requirements.txt, then restart.')
                     else:
-                        if self.running and self.auto.get() and generation == self.generation:
+                        if backend == 'OpenAI' and generation == self.generation and (task == 'test' or (self.running and self.auto.get())):
+                            self.consume_cloud(detected, task, captured_at)
+                        elif backend != 'OpenAI' and self.running and self.auto.get() and generation == self.generation:
                             self.detections = detected
                             for detection in self.tracker.update(detected, captured_at):
                                 self.counter.add(detection.rank, f'auto OCR ({detection.score:.2f})')
@@ -398,14 +581,20 @@ class App:
                             else:
                                 self.status.set(f'Tracking {readable} readable ranks in {len(detected)} candidate shapes. Count includes recognized cards only; verify that every exposed card is labeled. Reset at shuffle.')
                 if self.running and self.auto.get() and self.region and self.future is None:
-                    self.pending_generation, self.pending_time = self.generation, time.monotonic()
-                    self.future = self.worker.submit(self.read_auto, frame.copy())
-                if self.auto.get() and self.region:
+                    if self.backend.get() == 'OpenAI':
+                        if time.monotonic() >= self.next_api_at:
+                            self.submit_cloud(frame)
+                    else:
+                        self.pending_generation, self.pending_time = self.generation, time.monotonic()
+                        self.pending_backend, self.pending_task = 'Local OCR', 'live'
+                        self.future = self.worker.submit(self.read_auto, frame.copy())
+                if self.auto.get() and (self.region or self.test_frame is not None):
                     for detection in self.detections:
                         x, y, w, h = detection.box
                         color = (50, 200, 50) if detection.rank else (0, 180, 255)
                         cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-                        cv2.putText(frame, f'{detection.rank or "?"} {detection.score:.2f}', (x, max(16, y-5)),
+                        label = f'{detection.rank or "?"} AI' if self.backend.get() == 'OpenAI' else f'{detection.rank or "?"} {detection.score:.2f}'
+                        cv2.putText(frame, label, (x, max(16, y-5)),
                                     cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2)
                 try:
                     threshold = float(self.threshold.get())
@@ -432,7 +621,7 @@ class App:
                 self.preview.configure(image=self.photo)
         except Exception as exc:
             self.running = False
-            self.status.set(f'Capture paused: {exc}')
+            self.status.set(str(exc) if isinstance(exc, VisionError) else f'Capture paused: {exc}')
         self.window.after(200, self.tick)
 
     def save(self):
@@ -481,6 +670,7 @@ class App:
 
     def close(self):
         self.running = False
+        self.api_key = ''
         self.worker.shutdown(wait=False, cancel_futures=True)
         self.capture.close()
         self.window.destroy()
