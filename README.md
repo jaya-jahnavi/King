@@ -1,6 +1,6 @@
 # King — automatic live screen card counting
 
-A local Python desktop tool for a visible browser video or screen stream. Automatic mode detects mostly exposed white cards, reads their corner ranks with RapidOCR, and tracks them to display a Hi-Lo running count and estimated true count. No video is uploaded. OCR models download on first use and inference runs locally.
+A Python desktop tool for a visible browser video or screen stream. The local OCR reader detects mostly exposed white cards with RapidOCR and performs inference locally. The optional OpenAI reader sends selected table images to the OpenAI API for recognition. Both update a Hi-Lo running count and estimated true count; the OpenAI path is implemented but has not yet been validated with a live account on the supplied recording.
 
 ## Run on Windows
 
@@ -11,6 +11,25 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe app.py
 ```
+
+## OpenAI reader — set your key in the app
+
+1. Restart `app.py`. Click **Set API key** and enter your key into the masked dialog in King. Never paste the key into chat or source code. The key stays in memory for this app session; it is not saved in calibration, logs or GitHub. Alternatively, set `OPENAI_API_KEY` in the environment before launching. Local OCR remains the startup default and makes no OpenAI calls.
+2. Click **Test recording (1 call)**, choose a recording or image, choose a timestamp (60 seconds for the supplied recording), and select only the MAIN tabletop in the frame. Exclude the duplicate digital dealer overlay, account information, browser controls and other tables. This makes one paid API request and shows ranks, a visible-set Hi-Lo total and measured request time. It does not change the shoe count. For the supplied frame near 60 seconds, the manually read reference is 11 exposed cards with visible-set Hi-Lo −3. Compare every card rather than checking only the total. An identical total can hide errors.
+3. The initial model is `gpt-6.1-terra`; choose another listed vision/structured-output model if your account does not support it. The key is not validated until a request succeeds. A successful request does not establish recognition accuracy on other images.
+4. For live use after validation, choose **OpenAI**, keep **Automatic card reading** checked, select the video display and **Select table**. If a region was already selected, press **Start / Pause**. Enter starting decks and reset at each shuffle. Start from the beginning of a shoe for a meaningful count.
+5. **Min seconds** defaults to 2 (range 1–30). This is a minimum time between request starts, not a promised response time. Only one recognition request runs at once. The app shows measured latency, image age, token usage and requests started. Preview continues while a request is running. Results more than 30 seconds old pause live counting without applying that result.
+6. **Call limit** defaults to 60 requests per app session. Recording tests, failed requests and live reads all consume this local limit. The app pauses at the limit; increasing it explicitly allows more paid requests. Calls are not automatically retried. This is a request-count limit, not a dollar budget. Stopping capture does not cancel a request already sent; that request may finish and incur charges. Closing/restarting King starts a fresh local request counter.
+
+OpenAI mode compares complete rank multisets, rather than trusting model coordinates as card identities. Two successive agreeing complete observations are needed before adding the new cards. Repeated sightings, including equal-rank cards, are handled by multiplicity: a second `K` increases the count of kings from one to two; an unchanged pair does not add again. Previously counted ranks disappearing or changing blocks additions until the table clearly clears or the user intervenes. Two or more complete empty-table reads spanning at least three seconds rearm the hand while retaining the shoe count. An unclear or incomplete read never acts as an empty table.
+
+This assumes dealt cards remain on the table until the round is cleared. Removing cards early, camera cuts, the model claiming an incorrect reading is complete, or missing a full clear-table interval can still cause counting errors. **Next round** rearms tracking manually; use it only after old cards clear. Reader/model changes pause and reset hand tracking, so resume on a fresh round if cards have already been counted. Manual cards can duplicate automatic detections; use them carefully when correcting an error. The display is an observed count, not a guarantee that every card was recognized. There is no established live accuracy or latency yet for your account and stream.
+
+Only the selected crop is uploaded as a JPEG (downscaled to a maximum side of 2048 pixels). Requests go to `https://api.openai.com/v1/responses`, use structured JSON outputs and `store=false`. That flag disables response storage for retrieval; it is not a promise of zero retention by the API provider. No API key or uploaded image is persisted by this integration. Model scores are not shown as probabilities. Authentication, quota, refusal, incomplete output and malformed responses pause or reject observations without changing the count.
+
+Official implementation references: [image inputs](https://developers.openai.com/api/docs/guides/images-vision), [structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs), and [GPT-6.1 Terra capabilities](https://developers.openai.com/api/docs/models/gpt-6.1-terra).
+
+Integration checks passed with mocked network responses: masked-key setup without key persistence, extracting the actual recording's 60-second frame and selected crop, one-call test without count mutation, two-observation confirmation, duplicate prevention, incomplete observations, request caps and stale results. The latest unit run passed 25 tests and skipped one opt-in local OCR test. **No live OpenAI requests were made during development because an API key was not configured.** Recognition accuracy, account access and end-to-end API latency must be checked using Test recording before live use.
 
 ## Extended desktop / second monitor
 
