@@ -20,7 +20,7 @@ The Live count tab has three steps:
 2. **Choose video area:** pick the video screen in the dropdown, then select only the main playing surface. Exclude browser controls, other tables, hand totals, chips where possible, and the duplicate digital dealer overlay. Keep the browser visible, with King outside the captured area or on another screen.
 3. **Start counting:** the app stays paused until this explicit step, including after loading a saved region. Start at the beginning of a shoe and set the number of decks with **New shoe**. Entering mid-shoe cannot reconstruct cards dealt earlier.
 
-Settings contains model choice, connection diagnostics, request limits, screen refresh, the recording test and advanced local template tools. Corrections contains manual rank buttons, Undo last card and the card event log. These tools are separate from the main dashboard so the live count is easy to follow.
+Settings contains model choice, connection diagnostics, request limits, screen refresh and the recording test. Card positions has the separate manual-template setup, saved position list and template readiness. Corrections contains manual rank buttons, Undo last card and the card event log. These tools are separate from the main dashboard so the live count is easy to follow.
 
 ## Understand the dashboard
 
@@ -106,13 +106,28 @@ Capture and preview were checked on the actual second 1920 × 1080 display, incl
 
 Settings allows switching to Local OCR. That experimental white-contour/OCR pipeline failed to recognize ranks in sampled frames of the supplied live-dealer footage. Small, tilted, overlapping cards and white table markings defeat it; no reliable fix for that reader is claimed.
 
-For a consistent close-up layout, disable automatic reading in advanced Settings, add tight rank-only card positions, then save all 13 rank templates (2–10/J/Q/K/A) from the stream. A manual position emits once per round; Next round rearms it. This mode is not a general detector and needs recalibration when appearance/layout changes. Neither reader detects shuffles automatically or reads hidden cards.
+For a consistent close-up layout, open **Card positions**:
+
+1. **Choose video area** first. **Add card position** temporarily hides King so it does not cover the browser, then opens an image of the selected table. Drag a tight box around one upright rank (exclude its suit), and press Enter or Use selected area. Escape cancels without adding anything.
+2. A successful selection explicitly switches to manual/local template reading, adds the position to the visible list, and saves it. **Show on live preview** displays its outlined box. OpenAI automatic reads do not use these positions. To correct a missing count instead, use Add to selected/previous round.
+3. **Save rank template** uses the same selection flow and asks for the rank label. Save all 13 templates (2–10/J/Q/K/A), with padding consistent with the position boxes. The page shows the saved template count and missing ranks. Start stays blocked until all 13 are ready; partial template collections cannot disambiguate ranks reliably.
+4. **Use these positions** activates saved positions and opens the Live count tab. Press Start on a fresh round. Four consecutive matching frames count a position once; Next round rearms it. The saved manual mode and selected reader restore after restarting, still paused. Remove selected position deletes just that chosen box and pauses counting.
+5. Choose a reader in Settings to return to automatic reading. Selecting OpenAI enables its automatic path; it does not silently keep using manual boxes. Counts remain saved, and a fresh round is required if the reader change interrupts an already counted hand.
+
+This mode is not a general detector and needs recalibration when appearance/layout changes. Neither reader detects shuffles automatically or reads hidden cards. Geometry, drag/reverse-drag, cancellation, mode activation/persistence, template saving and synthetic per-round counting have GUI checks; this does not establish recognition accuracy on your tilted/overlapping live-dealer footage.
 
 ## Development checks
 
 ```powershell
 python -m unittest discover -s tests -v
 python -m compileall -q app.py interface.py counting.py openai_vision.py
+```
+
+To include desktop workflow checks for manual card positions:
+
+```powershell
+$env:KING_TEST_GUI='1'
+python -m unittest discover -s tests -v
 ```
 
 Opt-in generated-card OCR check (may download local OCR models):
