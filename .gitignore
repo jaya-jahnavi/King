@@ -2,3 +2,8 @@
 __pycache__/
 calibration/
 *.csv
+models/
+recognition-audit*.json
+.env
+.env.*
+!.env.example
