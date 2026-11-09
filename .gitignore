@@ -7,3 +7,4 @@ recognition-audit*.json
 .env
 .env.*
 !.env.example
+king-gui-test-*/
