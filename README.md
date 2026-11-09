@@ -45,8 +45,21 @@ The activity line distinguishes a request currently processing from the last fin
 - History saves automatically after card additions, corrections, round changes and shoe changes to `calibration/session.json`. It contains round-tagged card events and timestamps, not screenshots or API keys. The original calibration folder remains ignored by Git.
 - Restarting restores cards, round numbers and running count but stays paused. If the restored round has cards, wait for the physical cards to clear, then use **Next round** before starting. This prevents a cold recognizer from silently recounting an unfinished hand. Use only one King app instance with this history folder at a time.
 - **New shoe** archives the previous shoe's observed rounds, resets running count, and begins Round 1 for the next shoe. Previous rounds remain in the history table. It does not reset the API request counter.
+- **Clear data / Start Round 1** (top right) is for starting over or moving to another table. It asks for confirmation, then removes the app's active saved round/card history, resets shoe and round numbering to 1, resets count to 0 and clears the old video crop. Choose the new table area before starting. API key, deck setting, other settings and session request usage are retained; exported CSV files are not deleted. Cancel leaves counts/history unchanged and paused. An old in-flight read cannot repopulate cleared data.
 - **Export rounds CSV** writes one row per round: shoe, round number, recognized cards, number of cards, round count, running count, status and first/last card timestamps. Select a round row to review its cards in the side panel. Lists reflect observation order, not guaranteed physical dealing order.
 - Undo pauses and removes the most recent card only from the current round. It cannot silently alter a previously saved round. Manual additions can duplicate automatic reads; use them carefully. If history cannot be read or saved, the app shows a separate history warning and preserves the existing file; New shoe backs up an unreadable file before starting fresh.
+
+## Add a missed card to an older round
+
+Use the two buttons just above the round history:
+
+1. **Add to previous round** targets the last saved round before the current one. The popup identifies its shoe and round. If no previous round exists, the app says so without changing data.
+2. **Add to selected round** targets the row you clicked in the history table, including saved rounds from earlier shoes. With no row selected it targets the current round.
+3. Choose the missed rank (2–10, J, Q, K or A) in the popup. One click adds one card, recalculates that round's count and every later running total in the same shoe, then saves the corrected history. Other shoes keep their own independent counts. CSV export includes the corrected values. Cancel adds nothing.
+
+Example: Round 1 had `2 K` (round count 0), and Round 2 had `3` (running +1). Add a missed `6` to Round 1: Round 1 becomes +1, Round 2 remains +1 for that round, and the running count after Round 2 becomes +2.
+
+Counting pauses while correcting, and pending reads from before the correction cannot alter the updated count. Correcting the active OpenAI round also updates duplicate tracking, so a later successful read of that manually counted card is not automatically added again. This cannot tell whether a manually entered card was actually missed: check the recorded list before adding it. For active local/template rounds, resume on a fresh round after old cards clear because the missing card cannot be associated with a particular local position reliably. Older-round corrections leave current-round recognition tracking intact.
 
 ## Faster updates
 
