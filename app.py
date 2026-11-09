@@ -17,6 +17,7 @@ from counting import Counter, RoundGate, RANKS
 from automatic import AutoReader, AutoTracker
 from displays import bounds, contains, physical_selection, capture_region, enable_dpi_awareness
 from openai_vision import OpenAIReader, VisionGate, VisionError, DEFAULT_MODEL
+from interface import build_ui
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'calibration'
@@ -50,6 +51,7 @@ class App:
         self.capture = mss.mss()
         self.monitors = [bounds(m) for m in self.capture.monitors[1:]]
         self.region = None
+        self.layout_problem = None
         self.slots = []
         self.templates = {}
         self.counter = Counter()
@@ -62,83 +64,100 @@ class App:
         self.future = None
         self.generation = 0
         self.detections = []
-        self.backend = tk.StringVar(value='Local OCR')
+        self.backend = tk.StringVar(value='OpenAI')
+        self.speed = tk.StringVar(value='Fast (1 read)')
         self.api_model = tk.StringVar(value=DEFAULT_MODEL)
         self.api_key = os.environ.get('OPENAI_API_KEY', '').strip()
-        self.api_interval = tk.DoubleVar(value=2)
+        self.api_interval = tk.DoubleVar(value=1)
         self.api_limit = tk.IntVar(value=60)
         self.api_calls = 0
         self.api_tokens = [0, 0]
         self.next_api_at = 0
         self.vision_gate = VisionGate()
         self.test_frame = None
-        self.api_info = tk.StringVar(value='Local OCR selected. OpenAI mode sends the selected table crop to OpenAI and incurs API charges.')
+        self.last_count_at = None
+        self.last_read_at = None
+        self.resume_requires_fresh_round = False
+        self.history_save_allowed = True
+        self._round_rows = {}
+        self.api_info = tk.StringVar(value='OpenAI is selected. Set your API key to begin. Image requests incur charges; nothing is uploaded until Start or Test recording.')
         self.status = tk.StringVar(value='Screen preview is live. Select the screen containing your browser, then click Select table.')
         self.stats = tk.StringVar()
         self.threshold = tk.DoubleVar(value=0.90)
-        window.title('King • Live card count prototype')
-        window.geometry('1060x820')
-        source = ttk.Frame(window, padding=8)
-        source.pack(fill='x')
-        ttk.Label(source, text='Screen:').pack(side='left')
-        self.monitor_names = self.display_names()
-        self.monitor_choice = ttk.Combobox(source, values=self.monitor_names, state='readonly', width=38)
-        self.monitor_choice.current(0)
-        self.monitor_choice.pack(side='left', padx=8)
-        self.monitor_choice.bind('<<ComboboxSelected>>', self.change_display)
-        ttk.Button(source, text='Refresh screens', command=self.refresh_displays).pack(side='left', padx=4)
-        self.capture_info = tk.StringVar()
-        ttk.Label(window, textvariable=self.capture_info, padding=4, wraplength=1000).pack(fill='x')
-        ttk.Checkbutton(source, text='Automatic card reading', variable=self.auto, command=self.change_mode).pack(side='left')
-        ttk.Label(source, text='Select table to start automatic counting.').pack(side='left', padx=8)
-        cloud = ttk.Frame(window, padding=6)
-        cloud.pack(fill='x')
-        ttk.Label(cloud, text='Reader:').pack(side='left')
-        provider = ttk.Combobox(cloud, textvariable=self.backend, values=['Local OCR', 'OpenAI'], state='readonly', width=11)
-        provider.pack(side='left', padx=4)
-        provider.bind('<<ComboboxSelected>>', self.change_mode)
-        model = ttk.Combobox(cloud, textvariable=self.api_model, values=[DEFAULT_MODEL, 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'], state='readonly', width=18)
-        model.pack(side='left', padx=4)
-        model.bind('<<ComboboxSelected>>', self.change_mode)
-        ttk.Button(cloud, text='Set API key', command=self.set_api_key).pack(side='left', padx=3)
-        ttk.Button(cloud, text='Test recording (1 call)', command=self.test_recording).pack(side='left', padx=3)
-        ttk.Label(cloud, text=' Min seconds:').pack(side='left')
-        ttk.Spinbox(cloud, from_=1, to=30, textvariable=self.api_interval, width=4).pack(side='left')
-        ttk.Label(cloud, text=' Call limit:').pack(side='left')
-        ttk.Spinbox(cloud, from_=1, to=1000, textvariable=self.api_limit, width=5).pack(side='left')
-        ttk.Label(window, textvariable=self.api_info, wraplength=1000, padding=4).pack(fill='x')
-        bar = ttk.Frame(window, padding=10)
-        bar.pack(fill='x')
-        for label, command in [('Select table', self.select_table), ('Add card position', self.add_slot),
-                               ('Save rank template', self.template), ('Start / Pause', self.toggle),
-                               ('Next round', self.next_round), ('Shuffle / New shoe', self.shuffle)]:
-            ttk.Button(bar, text=label, command=command).pack(side='left', padx=3)
-        ttk.Label(window, textvariable=self.stats, font=('Segoe UI', 19)).pack(pady=8)
-        ttk.Label(window, textvariable=self.status, wraplength=1000).pack(padx=12, pady=6)
-        self.preview = ttk.Label(window)
-        self.preview.pack(pady=6)
-        controls = ttk.Frame(window, padding=8)
-        controls.pack(fill='x')
-        ttk.Label(controls, text='Manual card:').pack(side='left')
-        for rank in RANKS:
-            ttk.Button(controls, text=rank, width=3, command=lambda r=rank: self.manual(r)).pack(side='left', padx=1)
-        ttk.Button(controls, text='Undo last', command=self.undo).pack(side='left', padx=6)
-        ttk.Button(controls, text='Export CSV', command=self.export).pack(side='left')
-        ttk.Label(controls, text=' Manual match:').pack(side='left')
-        ttk.Spinbox(controls, from_=0.7, to=0.99, increment=0.01, width=5, textvariable=self.threshold).pack(side='left')
-        self.log = tk.Listbox(window, height=8, font=('Consolas', 10))
-        self.log.pack(fill='both', expand=True, padx=12, pady=8)
-        ttk.Label(window, text='Automatic: visible white cards • Three matching reads • Clear table for 3 seconds between hands • Reset at shuffle',
-                  padding=8).pack()
+        build_ui(self)
         self.load()
-        if self.region:
-            self.running = True
-            self.status.set('Starting automatic reader for saved table region. Keep King outside the captured area.')
+        self.load_session()
+        self.running = False
+        self.change_speed()
+        if self.layout_problem:
+            self.status.set(f'Choose the video area again: {self.layout_problem}. Saved counts are retained.')
+        elif self.resume_requires_fresh_round:
+            self.status.set('Saved history restored. Wait for old cards to clear, click Next round, then Start.')
+        elif self.region:
+            self.status.set('Video area is ready. Connect OpenAI if needed, then Start counting.')
         self.refresh()
         self.update_capture_info()
         window.protocol('WM_DELETE_WINDOW', self.close)
         window.after(200, self.tick)
         window.after(3000, self.check_displays)
+        window.after(100, self.update_activity)
+
+    def change_speed(self, event=None):
+        self.running = False
+        self.invalidate()
+        self.vision_gate.confirmations = 1 if self.speed.get().startswith('Fast') else 2
+        self.vision_gate.pending, self.vision_gate.hits = None, 0
+        self.mode_hint.set(('One AI read · less verification' if self.vision_gate.confirmations == 1 else 'Two agreeing AI reads')
+                           if self.backend.get() == 'OpenAI' else 'Local OCR · 3 matching frames')
+        self.next_api_at = 0
+        self.status.set('Speed selected. Fast counts use one AI read and can include recognition errors. Press Start when ready.'
+                        if self.vision_gate.confirmations == 1 else 'Verified mode waits for two agreeing complete reads. Press Start when ready.')
+
+    def update_activity(self):
+        now = time.monotonic()
+        if self.future is not None and not self.future.done():
+            self.activity.set(f'Reading image… {now-self.pending_time:.1f}s · count below is the last completed update')
+        elif self.running:
+            age = f'{now-self.last_read_at:.0f}s ago' if self.last_read_at is not None else 'waiting for first read'
+            self.activity.set(f'Counting · last completed read: {age}')
+        else:
+            self.activity.set('Paused · saved counts remain visible')
+        self.start_label.set('Pause counting' if self.running else '3  Start counting')
+        self.window.after(100, self.update_activity)
+
+    def load_session(self):
+        path = DATA / 'session.json'
+        if not path.exists():
+            return
+        try:
+            self.counter = Counter.from_dict(json.loads(path.read_text(encoding='utf-8')))
+            self.resume_requires_fresh_round = bool(self.counter.round_cards)
+        except (OSError, ValueError, KeyError, TypeError):
+            self.history_save_allowed = False
+            self.history_note.set('Saved history could not be read. Original file kept; New shoe will preserve a backup before starting fresh.')
+
+    def save_session(self):
+        if not self.history_save_allowed:
+            return
+        try:
+            DATA.mkdir(exist_ok=True)
+            path = DATA / 'session.json'
+            temporary = DATA / 'session.tmp'
+            temporary.write_text(json.dumps(self.counter.to_dict(), indent=2), encoding='utf-8')
+            temporary.replace(path)
+            self.history_note.set('Saved automatically on this computer · round numbers start when you begin using King.')
+        except OSError:
+            self.history_note.set('History could not be saved. Check folder access and export a CSV before closing.')
+
+    def show_round(self, event=None):
+        selected = self.round_table.selection()
+        row = self._round_rows.get(selected[0]) if selected else None
+        if row is None:
+            row = self.counter.summaries()[-1]
+        cards = '  '.join(row['cards']) or 'Waiting for cards'
+        self.round_details.set(f'Shoe {row["shoe"]} · Round {row["round"]}\n{cards}\n\n'
+                               f'{row["card_count"]} cards · Round count: {row["round_count"]:+d}\n'
+                               f'Running count: {row["running_count"]:+d}')
 
     def grab(self):
         return np.array(self.capture.grab(self.region))[:, :, :3].copy()
@@ -224,6 +243,7 @@ class App:
         self.detections = []
         self.vision_gate.reset()
         self.test_frame = None
+        self.resume_requires_fresh_round = bool(self.counter.round_cards)
 
     def change_display(self, event=None):
         self.reset_capture_source()
@@ -279,6 +299,9 @@ class App:
         self.detections = []
         self.test_frame = None
         self.next_api_at = 0
+        self.resume_requires_fresh_round = bool(self.counter.round_cards)
+        self.mode_hint.set(('One AI read · less verification' if self.vision_gate.confirmations == 1 else 'Two agreeing AI reads')
+                           if self.backend.get() == 'OpenAI' else 'Local OCR · 3 matching frames')
         self.status.set('Reader changed; paused. Test OpenAI on a recording first. If cards were already counted, resume on a fresh round to avoid recounting.')
         self.api_info.set(f'OpenAI uploads cropped images and incurs charges. {self.api_calls} requests started this session; key is kept in memory.'
                           if self.backend.get() == 'OpenAI' else 'Local OCR selected. No new OpenAI requests; any in-flight request may still finish.')
@@ -297,6 +320,7 @@ class App:
         self.auto.set(True)
         self.change_mode()
         self.api_info.set('Key set for this session; not yet validated. Test recording makes one paid image request. No key is saved to disk.')
+        self.status.set('API key set for this session. Use Settings > Test recording to check it, then choose your video area and Start.')
         return True
 
     def ensure_api_key(self):
@@ -321,7 +345,7 @@ class App:
         self.api_calls += 1
         self.next_api_at = self.pending_time+interval
         self.api_info.set(f'OpenAI {self.api_calls}/{limit} requests started; image processing. Selected table crop sent to OpenAI. Pause stops new requests.')
-        self.future = self.worker.submit(reader.read, frame.copy())
+        self.future = self.worker.submit(reader.read, frame.copy(), compact=(task == 'live'))
 
     def test_recording(self):
         self.running = False
@@ -391,14 +415,21 @@ class App:
             self.detections = []
             self.status.set('OpenAI result is over 30 seconds old; live counting paused without applying it.')
             return
+        self.last_read_at = time.monotonic()
         added = self.vision_gate.update(observation, captured_at)
+        if self.vision_gate.round_ended:
+            self.counter.finish_round()
+            self.refresh()
         if len(self.counter.events)+len(added) > self.counter.decks*52:
             raise VisionError('Shoe exhausted; reset after the shuffle. No cards from this observation were added.')
         for rank in added:
-            self.counter.add(rank, f'OpenAI ({age:.1f}s image age)')
+            speed = 'Fast, one read' if self.vision_gate.confirmations == 1 else 'Verified, two reads'
+            self.counter.add(rank, f'OpenAI {speed} ({age:.1f}s image age)')
         if added:
+            self.last_count_at = time.monotonic()
             self.refresh()
-        self.status.set(self.vision_gate.note)
+        prefix = 'Fast · one AI read: ' if self.vision_gate.confirmations == 1 else ''
+        self.status.set(prefix+self.vision_gate.note)
 
     def read_auto(self, frame):
         if self.reader is None:
@@ -421,6 +452,7 @@ class App:
             if box:
                 x, y, w, h = box
                 self.region = capture_region(monitor, box)
+                self.layout_problem = None
                 self.slots = []
                 self.gate.reset()
                 self.tracker.reset()
@@ -428,14 +460,14 @@ class App:
                 self.test_frame = None
                 self.detections = []
                 self.save()
-                self.running = self.auto.get() and not self.counter.events and (self.backend.get() != 'OpenAI' or bool(self.api_key))
+                self.running = False
                 self.update_capture_info()
                 if self.counter.events:
                     self.status.set('Table selected; shoe count retained. Wait for a fresh round before pressing Start to avoid recounting existing cards.')
                 elif self.auto.get() and self.backend.get() == 'OpenAI' and not self.api_key:
                     self.status.set('Table selected. Click Set API key, then Test recording or Start for OpenAI image recognition.')
                 else:
-                    self.status.set('Automatic reader starting. Keep King outside the table crop.' if self.running else 'Table selected. Configure manual positions or enable automatic reading.')
+                    self.status.set('Video area selected. Press Start counting when the table is ready.')
         except Exception as exc:
             self.status.set(f'Could not select screen: {exc}')
         finally:
@@ -479,6 +511,8 @@ class App:
         if not self.running:
             if not self.region:
                 return self.status.set('Click Select table and select the browser video first.')
+            if self.resume_requires_fresh_round:
+                return self.status.set('Wait for old cards to clear, click Next round, then Start. Saved cards will not be counted again.')
             if not self.auto.get():
                 if not self.slots:
                     return self.status.set('Add card positions for manual mode, or enable Automatic card reading.')
@@ -506,14 +540,25 @@ class App:
         self.tracker.reset()
         self.vision_gate.reset()
         self.invalidate()
-        self.status.set('Card tracking reset; shoe count retained. Wait for old cards to clear, then press Start.')
+        advanced = self.counter.finish_round()
+        self.resume_requires_fresh_round = False
+        self.refresh()
+        self.status.set(f'Round {self.counter.round_number} ready; previous round saved.' if advanced else
+                        f'Round {self.counter.round_number} is waiting for cards. No empty round was added.')
 
     def shuffle(self):
         decks = simpledialog.askinteger('New shoe', 'Starting decks (1–12):', initialvalue=self.counter.decks,
                                         minvalue=1, maxvalue=12, parent=self.window)
         if decks is not None:
             self.running = False
-            self.counter = Counter(decks)
+            if not self.history_save_allowed:
+                try:
+                    (DATA / 'session.json').replace(DATA / f'session-backup-{time.time_ns()}.json')
+                    self.history_save_allowed = True
+                except OSError:
+                    return self.history_note.set('Could not back up old history. Original file preserved; new shoe not started.')
+            self.counter.new_shoe(decks)
+            self.resume_requires_fresh_round = False
             self.gate.reset()
             self.tracker.reset()
             self.vision_gate.reset()
@@ -524,6 +569,7 @@ class App:
     def manual(self, rank):
         try:
             self.counter.add(rank)
+            self.last_count_at = time.monotonic()
             self.refresh()
         except ValueError as exc:
             self.status.set(str(exc))
@@ -531,8 +577,10 @@ class App:
     def undo(self):
         self.running = False
         self.invalidate()
-        if self.counter.events:
+        if self.counter.events and self.counter.events[-1].round_number == self.counter.round_number:
             self.counter.events.pop()
+        else:
+            return self.status.set('No cards in the current round to undo. Saved previous rounds remain unchanged.')
         self.refresh()
         self.status.set('Paused. Last card removed; its track stays counted. Add its correct rank manually if needed.')
 
@@ -542,8 +590,29 @@ class App:
                        f'     Decks left ≈ {self.counter.remaining:.2f}')
         self.log.delete(0, tk.END)
         for i, event in enumerate(self.counter.events, 1):
-            self.log.insert(tk.END, f'{i:3}  {event.rank:>2}  {event.source}')
+            self.log.insert(tk.END, f'Round {event.round_number:<3}  {i:3}  {event.rank:>2}  {event.source}')
         self.log.see(tk.END)
+        self.running_value.set(f'{self.counter.running:+d}')
+        self.round_value.set(f'{self.counter.round_count:+d}')
+        self.round_badge.set(f'Round {self.counter.round_number}')
+        self.cards_value.set(str(len(self.counter.round_cards)))
+        selected = self.round_table.selection()
+        follow = not selected or selected[0] == getattr(self, 'current_round_key', None)
+        self.round_table.delete(*self.round_table.get_children())
+        self._round_rows = {}
+        for row in self.counter.summaries():
+            key = f'{row["shoe"]}:{row["round"]}'
+            self._round_rows[key] = row
+            self.round_table.insert('', 'end', iid=key, values=(row['shoe'], f'Round {row["round"]}',
+                                   ' '.join(row['cards']) or 'Waiting for cards', f'{row["round_count"]:+d}',
+                                   f'{row["running_count"]:+d}', row['state']))
+        self.current_round_key = f'{self.counter.shoe_number}:{self.counter.round_number}'
+        target = self.current_round_key if follow or selected[0] not in self._round_rows else selected[0]
+        self.round_table.selection_set(target)
+        if follow:
+            self.round_table.see(target)
+        self.show_round()
+        self.save_session()
 
     def tick(self):
         try:
@@ -572,9 +641,15 @@ class App:
                             self.consume_cloud(detected, task, captured_at)
                         elif backend != 'OpenAI' and self.running and self.auto.get() and generation == self.generation:
                             self.detections = detected
-                            for detection in self.tracker.update(detected, captured_at):
-                                self.counter.add(detection.rank, f'auto OCR ({detection.score:.2f})')
+                            additions = self.tracker.update(detected, captured_at)
+                            if self.tracker.round_ended:
+                                self.counter.finish_round()
                                 self.refresh()
+                            for detection in additions:
+                                self.counter.add(detection.rank, f'auto OCR ({detection.score:.2f})')
+                                self.last_count_at = time.monotonic()
+                                self.refresh()
+                            self.last_read_at = time.monotonic()
                             readable = sum(bool(d.rank) for d in detected)
                             if not readable:
                                 self.status.set(f'No card ranks recognized ({len(detected)} candidate shapes). The displayed count is unverified and may be incomplete. Crop to the main tabletop; small, tilted or overlapping cards may require a different detector.')
@@ -591,6 +666,8 @@ class App:
                 if self.auto.get() and (self.region or self.test_frame is not None):
                     for detection in self.detections:
                         x, y, w, h = detection.box
+                        if min(w, h) <= 0:
+                            continue
                         color = (50, 200, 50) if detection.rank else (0, 180, 255)
                         cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
                         label = f'{detection.rank or "?"} AI' if self.backend.get() == 'OpenAI' else f'{detection.rank or "?"} {detection.score:.2f}'
@@ -616,13 +693,13 @@ class App:
                     cv2.putText(frame, f'{i+1}:{rank or "?"} {score:.2f}', (x, max(15, y-5)),
                                 cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1)
                 rgb = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                rgb.thumbnail((1000, 420))
+                rgb.thumbnail((660, min(255, max(120, self.window.winfo_height()-620))))
                 self.photo = ImageTk.PhotoImage(rgb)
                 self.preview.configure(image=self.photo)
         except Exception as exc:
             self.running = False
             self.status.set(str(exc) if isinstance(exc, VisionError) else f'Capture paused: {exc}')
-        self.window.after(200, self.tick)
+        self.window.after(80, self.tick)
 
     def save(self):
         DATA.mkdir(exist_ok=True)
@@ -658,18 +735,22 @@ class App:
                     self.templates[rank] = normalized(template)
         except (ValueError, KeyError, TypeError) as exc:
             self.region, self.slots = None, []
+            self.layout_problem = str(exc)
             self.status.set(f'Calibration must be recreated: {exc}')
 
     def export(self):
-        filename = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV', '*.csv')])
+        filename = filedialog.asksaveasfilename(title='Save round history', initialfile='king-rounds.csv', defaultextension='.csv', filetypes=[('CSV', '*.csv')])
         if filename:
             with open(filename, 'w', newline='', encoding='utf-8') as output:
                 writer = csv.writer(output)
-                writer.writerow(['card', 'rank', 'source'])
-                writer.writerows((i, e.rank, e.source) for i, e in enumerate(self.counter.events, 1))
+                writer.writerow(['shoe', 'round', 'cards', 'card_count', 'round_count', 'running_count', 'status', 'first_card_at', 'last_card_at'])
+                for row in self.counter.summaries():
+                    writer.writerow([row['shoe'], row['round'], ' '.join(row['cards']), row['card_count'],
+                                     row['round_count'], row['running_count'], row['state'], row['first_card_at'], row['last_card_at']])
 
     def close(self):
         self.running = False
+        self.save_session()
         self.api_key = ''
         self.worker.shutdown(wait=False, cancel_futures=True)
         self.capture.close()
