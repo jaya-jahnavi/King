@@ -32,12 +32,32 @@ class Counter:
         self.archives = []
 
     def add(self, rank, source='manual'):
-        rank = rank.upper()
+        return self.add_to_round(self.shoe_number, self.round_number, rank, source)
+
+    def add_to_round(self, shoe_number, round_number, rank, source='manual missed card'):
+        if not isinstance(rank, str):
+            raise ValueError('Unknown card rank')
+        rank = rank.strip().upper()
         if rank not in RANKS:
             raise ValueError('Unknown card rank')
-        if len(self.events) >= self.decks * 52:
-            raise ValueError('Shoe exhausted; reset after the shuffle')
-        self.events.append(Event(rank, source, self.round_number))
+        if type(shoe_number) is not int or type(round_number) is not int:
+            raise ValueError('Choose an existing shoe and round')
+        current = shoe_number == self.shoe_number
+        shoe = self._shoe_data() if current else next((s for s in self.archives if s['shoe_number'] == shoe_number), None)
+        if shoe is None or not 1 <= round_number <= shoe['round_number']:
+            raise ValueError('Choose an existing shoe and round')
+        if not (current and round_number == self.round_number) and not any(e['round_number'] == round_number for e in shoe['events']):
+            raise ValueError('That round is not in the saved history')
+        if len(shoe['events']) >= shoe['decks'] * 52:
+            raise ValueError('That shoe already contains its maximum number of cards')
+        event = Event(rank, source, round_number)
+        if current:
+            position = next((i for i,e in enumerate(self.events) if e.round_number > round_number), len(self.events))
+            self.events.insert(position, event)
+        else:
+            position = next((i for i,e in enumerate(shoe['events']) if e['round_number'] > round_number), len(shoe['events']))
+            shoe['events'].insert(position, asdict(event))
+        return event
 
     @property
     def round_cards(self):
