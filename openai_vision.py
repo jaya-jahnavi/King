@@ -47,6 +47,21 @@ SCHEMA = {
     }
 }
 
+COMPACT_SCHEMA = {
+    'type': 'object', 'additionalProperties': False,
+    'required': ['table_state', 'complete', 'ranks'],
+    'properties': {
+        'table_state': SCHEMA['properties']['table_state'],
+        'complete': {'type': 'boolean'},
+        'ranks': {'type': 'array', 'maxItems': 64,
+                  'items': {'type': ['string', 'null'], 'enum': [*RANKS, None]}}
+    }
+}
+
+COMPACT_PROMPT = PROMPT[:PROMPT.index('Return normalized')] + '''Return ranks only: one array entry per exposed physical card,
+including repeated ranks for different cards. Use null for an unreadable rank. No boxes,
+suits, commentary or count. Keep the output compact.'''
+
 
 class VisionError(RuntimeError):
     """Only sanitized, user-facing messages; never include request headers/body."""
@@ -99,7 +114,7 @@ class OpenAIReader:
         if not self.model:
             raise VisionError('Choose an OpenAI model first.')
 
-    def read(self, frame):
+    def read(self, frame, compact=False):
         import cv2
         if frame is None or frame.size == 0:
             raise VisionError('Select a nonempty table crop first.')
@@ -112,12 +127,12 @@ class OpenAIReader:
         payload = {
             'model': self.model, 'store': False, 'max_output_tokens': 3500,
             'reasoning': {'effort': 'low'},
-            'input': [{'role': 'developer', 'content': PROMPT},
+            'input': [{'role': 'developer', 'content': COMPACT_PROMPT if compact else PROMPT},
                       {'role': 'user', 'content': [
                           {'type': 'input_text', 'text': 'Read this current table image.'},
                           {'type': 'input_image', 'detail': 'high',
                            'image_url': 'data:image/jpeg;base64,'+base64.b64encode(encoded).decode('ascii')}]}],
-            'text': {'format': {'type': 'json_schema', 'name': 'table_observation', 'strict': True, 'schema': SCHEMA}}
+            'text': {'format': {'type': 'json_schema', 'name': 'table_observation', 'strict': True, 'schema': COMPACT_SCHEMA if compact else SCHEMA}}
         }
         request = urllib.request.Request(ENDPOINT, data=json.dumps(payload).encode('utf-8'),
                                          headers={'Authorization': 'Bearer '+self._key, 'Content-Type': 'application/json'})
@@ -162,7 +177,16 @@ class OpenAIReader:
                             raise VisionError('OpenAI returned invalid text; no count was changed.')
                         texts.append(text)
         try:
-            observation = validate_observation(json.loads(''.join(texts)), width, height)
+            data = json.loads(''.join(texts))
+            if compact:
+                if not isinstance(data, dict) or set(data) != {'table_state', 'complete', 'ranks'} or not isinstance(data['ranks'], list):
+                    raise ValueError('Invalid compact observation')
+                data = dict(table_state=data['table_state'], complete=data['complete'], cards=[
+                    dict(rank=rank, suit=None, box=dict(x=0, y=0, width=1, height=1)) for rank in data['ranks']])
+            observation = validate_observation(data, width, height)
+            if compact:
+                for card in observation.cards:
+                    card.box = (0, 0, 0, 0)
         except (ValueError, TypeError, KeyError):
             raise VisionError('OpenAI returned an invalid observation; no count was changed.') from None
         observation.latency = time.monotonic()-started
@@ -181,7 +205,8 @@ class VisionGate:
     Intended for blackjack hands where dealt cards remain until the table clears.
     This is duplicate prevention, not proof the model recognized every card.
     """
-    def __init__(self):
+    def __init__(self, confirmations=2):
+        self.confirmations = confirmations
         self.reset()
 
     def reset(self):
@@ -190,9 +215,12 @@ class VisionGate:
         self.hits = 0
         self.empty_since = None
         self.empty_hits = 0
+        self.round_ended = False
+        self.clear_confirmed = False
         self.note = 'Waiting for two agreeing complete observations.'
 
     def update(self, observation, captured_at):
+        self.round_ended = False
         if observation.table_state == 'unclear' or not observation.complete:
             self.pending, self.hits = None, 0
             self.empty_since, self.empty_hits = None, 0
@@ -205,11 +233,14 @@ class VisionGate:
             self.empty_hits += 1
             if self.empty_hits >= 2 and captured_at-self.empty_since >= 3:
                 self.counted.clear()
+                self.round_ended = not self.clear_confirmed
+                self.clear_confirmed = True
                 self.note = 'Clear table confirmed; ready for the next hand. Shoe count retained.'
             else:
                 self.note = 'Checking clear table; previous card history retained.'
             return []
         self.empty_since, self.empty_hits = None, 0
+        self.clear_confirmed = False
         current = Counter(card.rank for card in observation.cards if card.rank)
         if any(current[rank] < amount for rank, amount in self.counted.items()):
             self.pending, self.hits = None, 0
@@ -218,7 +249,7 @@ class VisionGate:
         signature = tuple(sorted(current.items()))
         self.hits = self.hits+1 if signature == self.pending else 1
         self.pending = signature
-        if self.hits < 2:
+        if self.hits < self.confirmations:
             self.note = 'Confirming this card set with a second observation; count unchanged.'
             return []
         added = list((current-self.counted).elements())
