@@ -89,6 +89,19 @@ class TransportTests(unittest.TestCase):
         return np.zeros((100, 200, 3), dtype=np.uint8)
 
     @patch('openai_vision.urllib.request.urlopen')
+    def test_compact_live_output_preserves_duplicates_without_coordinates(self, urlopen):
+        data = dict(table_state='cards', complete=True, ranks=['2','2','K'])
+        response = dict(status='completed',output=[dict(type='message',content=[dict(type='output_text',text=json.dumps(data))])])
+        urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(response).encode()
+        result = OpenAIReader('unit-test-key').read(self.frame(),compact=True)
+        payload = json.loads(urlopen.call_args.args[0].data)
+        properties = payload['text']['format']['schema']['properties']
+        self.assertIn('ranks',properties)
+        self.assertNotIn('cards',properties)
+        self.assertEqual([c.rank for c in result.cards],['2','2','K'])
+        self.assertTrue(all(c.box == (0,0,0,0) for c in result.cards))
+
+    @patch('openai_vision.urllib.request.urlopen')
     def test_request_is_official_cropped_image_and_strict_json(self, urlopen):
         data = dict(table_state='empty', complete=True, cards=[])
         response = dict(status='completed', output=[dict(type='message', content=[dict(type='output_text', text=json.dumps(data))])],
