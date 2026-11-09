@@ -12,6 +12,18 @@ python -m venv .venv
 .\.venv\Scripts\python.exe app.py
 ```
 
+## Extended desktop / second monitor
+
+1. Set Windows projection to **Extend** (Win+P → Extend). Put the visible browser video on the external monitor and keep King on your laptop or other monitor.
+2. Choose that monitor in King's **Screen** dropdown. Entries include physical resolution and desktop coordinates, so equal-resolution screens are distinguishable. King's display numbers reflect its capture list and may differ from Windows Settings' numbers.
+3. Switching the dropdown immediately switches the full-screen preview, pauses recognition and clears the old crop. Click **Select table** and select the video area in the screenshot. Capture uses that monitor's physical pixels, including negative desktop coordinates for monitors placed left of or above the main display.
+4. If no cards have been counted yet, selecting a table starts automatic mode. If the shoe already has recorded cards, it stays paused and retains the shoe count: resume on a fresh round so old visible cards are not recounted. Moving or resizing the browser within the same monitor also requires selecting its table area again.
+5. King remembers the selected display and crop. Display connections, resolution or arrangement changes are checked every three seconds while the app is visible. A changed layout pauses recognition and clears the stale crop; choose the video display and select its table again. **Refresh screens** rescans immediately after connecting an external monitor.
+
+Windows per-monitor DPI awareness is requested at startup; selection coordinates map from the actual resized screenshot back to source pixels rather than applying the laptop's scaling to another display. Capture and preview were checked on an actual second 1920 × 1080 display to the right of the main display, including a 600 × 400 crop. Geometry and source-switching checks cover simulated layouts, including left/above monitors, saved selection, stale worker results and unplugging; mixed-DPI capture across physical monitors still needs hardware verification. Source selection does not resolve the documented card-recognition failure on the supplied stream.
+
+Implementation references: [Microsoft per-monitor DPI awareness](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setprocessdpiawarenesscontext) and [MSS capture coordinates](https://python-mss.readthedocs.io/stable/examples.html).
+
 ## Automatic mode (default)
 
 1. Run the installation command above again to install the new OCR dependencies. The first recognition may take longer while two OCR models download (about 30 MB total). Keep internet available for this first download; models are cached in `models/`.
