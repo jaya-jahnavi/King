@@ -116,7 +116,8 @@ class App:
     def update_activity(self):
         now = time.monotonic()
         if self.future is not None and not self.future.done():
-            self.activity.set(f'Reading image… {now-self.pending_time:.1f}s · count below is the last completed update')
+            self.activity.set(f'Reading image… {now-self.pending_time:.1f}s · count below is the last completed update' if self.running
+                              else 'Paused · the previous image request is finishing; no new reads will start')
         elif self.running:
             age = f'{now-self.last_read_at:.0f}s ago' if self.last_read_at is not None else 'waiting for first read'
             self.activity.set(f'Counting · last completed read: {age}')
@@ -158,6 +159,102 @@ class App:
         self.round_details.set(f'Shoe {row["shoe"]} · Round {row["round"]}\n{cards}\n\n'
                                f'{row["card_count"]} cards · Round count: {row["round_count"]:+d}\n'
                                f'Running count: {row["running_count"]:+d}')
+
+    def clear_data(self):
+        self.running = False
+        self.invalidate()
+        if not messagebox.askyesno('Clear saved counts and start Round 1?',
+                                  'Clear ALL round/card history and reset running count to 0?\n\n'
+                                  'You will start at Shoe 1, Round 1 and choose the new table area.\n'
+                                  'Your API key, settings and request usage stay unchanged. Exported CSV files are kept.',
+                                  default='no', parent=self.window):
+            self.status.set('Clear canceled. Saved data is unchanged; counting is paused.')
+            return False
+        if not self.history_save_allowed:
+            try:
+                (DATA / 'session.json').replace(DATA / f'session-backup-{time.time_ns()}.json')
+                self.history_save_allowed = True
+            except OSError:
+                self.history_note.set('Could not preserve unreadable history. No data was cleared.')
+                return False
+        self.counter = Counter(self.counter.decks)
+        self.reset_capture_source()
+        self.resume_requires_fresh_round = False
+        self.last_count_at, self.last_read_at = None, None
+        self.refresh()
+        self.update_capture_info()
+        try:
+            self.save()
+        except OSError:
+            self.status.set('Counts reset to Round 1, but video settings could not be saved. Choose the video area again.')
+            return True
+        self.status.set('Data cleared. Running count 0 · Shoe 1 · Round 1. Choose the new table video area, then Start.')
+        return True
+
+    def correction_target(self, previous=False):
+        rows = self.counter.summaries()
+        if previous:
+            saved = [row for row in rows if (row['shoe'], row['round']) !=
+                     (self.counter.shoe_number, self.counter.round_number) and row['cards']]
+            if not saved:
+                raise ValueError('There is no previous round yet. Select the current round to add a missed card.')
+            return saved[-1]
+        selected = self.round_table.selection()
+        if selected and selected[0] in self._round_rows:
+            return self._round_rows[selected[0]]
+        return rows[-1]
+
+    def add_missed_card(self, previous=False):
+        self.running = False
+        self.invalidate()
+        try:
+            row = self.correction_target(previous)
+        except ValueError as exc:
+            self.status.set(str(exc))
+            return
+        dialog = tk.Toplevel(self.window)
+        dialog.title('Add a missed card')
+        dialog.transient(self.window)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text=f'Shoe {row["shoe"]} · Round {row["round"]}', font=('Segoe UI', 15, 'bold')).pack(anchor='w')
+        ttk.Label(body, text='Choose the ONE card the reader missed. Counting is paused.\n'
+                            'This round and later running totals in the same shoe will update.').pack(anchor='w', pady=10)
+        buttons = ttk.Frame(body)
+        buttons.pack(anchor='w')
+        def choose(rank):
+            if self.apply_round_correction(row['shoe'], row['round'], rank):
+                dialog.destroy()
+        for i, rank in enumerate(RANKS):
+            ttk.Button(buttons, text=rank, width=5, command=lambda r=rank: choose(r)).grid(row=i//7, column=i%7, padx=3, pady=3)
+        ttk.Button(body, text='Cancel', command=dialog.destroy).pack(anchor='e', pady=(12, 0))
+        dialog.bind('<Escape>', lambda event: dialog.destroy())
+        dialog.grab_set()
+        dialog.focus_force()
+        self.window.wait_window(dialog)
+
+    def apply_round_correction(self, shoe_number, round_number, rank):
+        self.running = False
+        self.invalidate()
+        try:
+            self.counter.add_to_round(shoe_number, round_number, rank)
+        except ValueError as exc:
+            self.status.set(str(exc))
+            return False
+        if (shoe_number, round_number) == (self.counter.shoe_number, self.counter.round_number):
+            # Teach the cloud duplicate gate about manually counted cards, so a later
+            # successful read of the same card does not add it a second time.
+            self.vision_gate.counted.clear()
+            self.vision_gate.counted.update(self.counter.round_cards)
+            self.vision_gate.pending, self.vision_gate.hits = None, 0
+            if self.backend.get() != 'OpenAI' or not self.auto.get():
+                self.resume_requires_fresh_round = True
+        self.last_count_at = time.monotonic()
+        self.refresh()
+        note = 'Resume on a fresh round after old cards clear.' if self.resume_requires_fresh_round else 'Counting is paused; press Start when ready.'
+        self.status.set(f'Added {rank.upper()} to Shoe {shoe_number}, Round {round_number}. Totals recalculated and saved. {note}')
+        return True
 
     def grab(self):
         return np.array(self.capture.grab(self.region))[:, :, :3].copy()
@@ -567,12 +664,7 @@ class App:
             self.status.set('New shoe ready. Start counting from the beginning of the shoe.')
 
     def manual(self, rank):
-        try:
-            self.counter.add(rank)
-            self.last_count_at = time.monotonic()
-            self.refresh()
-        except ValueError as exc:
-            self.status.set(str(exc))
+        self.apply_round_correction(self.counter.shoe_number, self.counter.round_number, rank)
 
     def undo(self):
         self.running = False
